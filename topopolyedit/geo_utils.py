@@ -133,14 +133,14 @@ def point_to_segment(p, a, b):
     len2 = dx * dx + dy * dy
     if len2 <= 0.0:
         proj = QgsPointXY(ax, ay)
-        return proj, p.sqrdist(proj), 0.0
+        return proj, p.sqrDist(proj), 0.0
     t = ((px - ax) * dx + (py - ay) * dy) / len2
     if t < 0.0:
         t = 0.0
     elif t > 1.0:
         t = 1.0
     proj = QgsPointXY(ax + t * dx, ay + t * dy)
-    return proj, p.sqrdist(proj), t
+    return proj, p.sqrDist(proj), t
 
 
 def _on_seg(p, a, b, eps2):
@@ -175,9 +175,9 @@ def find_vertex(polys, pt, eps2):
     for _pi, _ri, ring in iter_rings(polys):
         n = len(ring)
         for vi in range(n):
-            if vi == n - 1 and n > 1 and ring[0].sqrdist(ring[-1]) <= DUP_EPS2:
+            if vi == n - 1 and n > 1 and ring[0].sqrDist(ring[-1]) <= DUP_EPS2:
                 continue  # пропускаем замыкающий дубликат
-            d2 = pt.sqrdist(ring[vi])
+            d2 = pt.sqrDist(ring[vi])
             if best_d2 is None or d2 < best_d2:
                 best_d2 = d2
                 best_pt = ring[vi]
@@ -209,7 +209,7 @@ def contains_vertex(polys, pt, eps2):
     """True, если хотя бы одна вершина структур совпадает с pt в пределах eps."""
     for _pi, _ri, ring in iter_rings(polys):
         for v in ring:
-            if v.sqrdist(pt) <= eps2:
+            if v.sqrDist(pt) <= eps2:
                 return True
     return False
 
@@ -231,7 +231,7 @@ def replace_vertices(polys, old_pt, new_pt, eps2):
         for ring in part:
             new_ring = []
             for v in ring:
-                if v.sqrdist(old_pt) <= eps2:
+                if v.sqrDist(old_pt) <= eps2:
                     new_ring.append(QgsPointXY(new_pt))
                     changed += 1
                 else:
@@ -244,7 +244,7 @@ def replace_vertices(polys, old_pt, new_pt, eps2):
 def _ring_has_point(ring, pt):
     """True, если в кольце уже есть вершина, совпадающая с pt (дубликат)."""
     for v in ring:
-        if v.sqrdist(pt) <= DUP_EPS2:
+        if v.sqrDist(pt) <= DUP_EPS2:
             return True
     return False
 
@@ -275,8 +275,8 @@ def insert_vertex_topo(polys, p1, p2, new_pt, eps2):
         done = False
         for si in range(n - 1):
             a, b = ring[si], ring[si + 1]
-            exact = ((a.sqrdist(p1) <= eps2 and b.sqrdist(p2) <= eps2) or
-                     (a.sqrdist(p2) <= eps2 and b.sqrdist(p1) <= eps2))
+            exact = ((a.sqrDist(p1) <= eps2 and b.sqrDist(p2) <= eps2) or
+                     (a.sqrDist(p2) <= eps2 and b.sqrDist(p1) <= eps2))
             if exact:
                 ring.insert(si + 1, QgsPointXY(new_pt))
                 inserted += 1

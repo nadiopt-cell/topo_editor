@@ -240,7 +240,7 @@ class TopoMoveTool(QgsMapTool):
                 new_pt = drag["ct_m2l"].transform(new_map_pt)
             except Exception:
                 new_pt = drag["ct_m2l"].transform(map_pt)
-            if new_pt.sqrdist(drag["picked"]) <= 1e-12:
+            if new_pt.sqrDist(drag["picked"]) <= 1e-12:
                 self._cleanup()
                 return
             editor = TopoEditor(self.iface, drag["layer"])

@@ -39,13 +39,15 @@ class QgsPointXY(object):
     def y(self):
         return self._y
 
-    def sqrdist(self, o):
+    def sqrDist(self, o):
+        # ВАЖНО: имена методов стáба должны ТОЧНО совпадать с реальным
+        # PyQGIS API (QgsPointXY.sqrDist) — иначе стаб маскирует опечатки.
         dx = self._x - o.x()
         dy = self._y - o.y()
         return dx * dx + dy * dy
 
     def distance(self, o):
-        return math.sqrt(self.sqrdist(o))
+        return math.sqrt(self.sqrDist(o))
 
     def __repr__(self):
         return "QgsPointXY(%r, %r)" % (self._x, self._y)

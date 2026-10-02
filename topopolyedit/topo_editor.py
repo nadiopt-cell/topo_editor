@@ -167,7 +167,7 @@ class TopoEditor(object):
         """
         report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0,
                   "error": None}
-        if new_pt.sqrdist(old_pt) <= 1e-12:
+        if new_pt.sqrDist(old_pt) <= 1e-12:
             report["error"] = u"узел не смещён"
             return report
         try:
@@ -245,7 +245,7 @@ class TopoEditor(object):
         :return: {"inserted", "features", "error"}
         """
         report = {"inserted": 0, "features": 0, "error": None}
-        if new_pt.sqrdist(p1) <= 1e-12 or new_pt.sqrdist(p2) <= 1e-12:
+        if new_pt.sqrDist(p1) <= 1e-12 or new_pt.sqrDist(p2) <= 1e-12:
             report["error"] = (u"точка вставки совпадает с вершиной ребра")
             return report
         try:

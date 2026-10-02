@@ -168,7 +168,7 @@ class SnappingEngine(object):
                     for part in nr[0]:
                         for ring in part:
                             n = len(ring)
-                            if n > 1 and ring[0].sqrdist(ring[-1]) <= 1e-12:
+                            if n > 1 and ring[0].sqrDist(ring[-1]) <= 1e-12:
                                 pts.extend(ring[:-1])
                             else:
                                 pts.extend(ring)
@@ -188,7 +188,7 @@ class SnappingEngine(object):
                         pts.append(QgsPointXY(p))
 
             for p in pts:
-                d2 = map_pt.sqrdist(p)
+                d2 = map_pt.sqrDist(p)
                 if d2 <= tol2 and (best_v is None or d2 < best_v[0]):
                     best_v = (d2, p, lyr, feat.id())
 
