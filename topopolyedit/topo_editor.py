@@ -19,7 +19,7 @@ from qgis.core import (
 
 from .geo_utils import (
     norm_polys, polys_to_geom, replace_vertices, insert_vertex_topo,
-    polys_bbox, contains_vertex,
+    polys_bbox, contains_vertex, translate_vertices,
 )
 from .snapping_engine import get_snap_layers
 
@@ -152,6 +152,70 @@ class TopoEditor(object):
             u"Топологическое редактирование", text,
             level=level, duration=duration)
 
+    def _apply_moves(self, entries, exclude_ids, command_text, eps):
+        """Единый edit-командный блок: запись новых геометрий + отсечение.
+
+        Общий конвейер операций перемещения (узла и ребра): габарит
+        новых геометрий, подбор эталонов, makeValid для невалидных
+        колец, difference по эталонам, changeGeometry. Одна операция
+        == одна команда отмены (Ctrl+Z).
+
+        :param entries: [{"fid", "polys", "multi"}, ...] — новые геометрии
+        :param exclude_ids: {fid, ...} — перемещаемые фичи (не эталоны)
+        :param command_text: название edit-команды (видно в истории отмены)
+        :param eps: допуск (единицы CRS слоя) — запас габарита
+        :return: {"moved", "clipped", "skipped", "refs"}
+        """
+        report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0}
+
+        # габарит всех новых геометрий + запас
+        bbox = None
+        for e in entries:
+            r = polys_bbox(e["polys"])
+            if bbox is None:
+                bbox = r
+            else:
+                bbox.combineExtentWith(r)
+        bbox.grow(eps)
+
+        refs, truncated = self._clip_references(bbox, exclude_ids)
+        report["refs"] = len(refs)
+        if truncated:
+            self._push(u"Эталонов для отсечения слишком много "
+                       u"(>{}), часть перехлестов могла остаться. "
+                       u"Уменьшите экстент.".format(MAX_CLIP_REFS),
+                       level=Qgis.Warning, duration=6)
+
+        self.layer.beginEditCommand(command_text)
+        for e in entries:
+            g = polys_to_geom(e["polys"], e["multi"])
+            if g.isNull() or g.isEmpty():
+                report["skipped"] += 1
+                continue
+            if not g.isGeosValid():
+                try:
+                    gv = g.makeValid()
+                    if not gv.isNull() and not gv.isEmpty() \
+                            and gv.type() == QgsWkbTypes.PolygonGeometry:
+                        g = gv
+                except Exception:
+                    pass
+
+            g, clipped_here = self._clip_against_refs(g, refs)
+
+            if g.isNull() or g.isEmpty():
+                # полигон полностью поглощён соседями — не меняем
+                report["skipped"] += 1
+                continue
+            if self.layer.changeGeometry(e["fid"], g):
+                report["moved"] += 1
+                report["clipped"] += clipped_here
+            else:
+                report["skipped"] += 1
+        self.layer.endEditCommand()
+        self.layer.triggerRepaint()
+        return report
+
     # ------------------------------------------------------------------
     # Операция 1: топологическое перемещение узла + автоотсечение
     # ------------------------------------------------------------------
@@ -175,54 +239,93 @@ class TopoEditor(object):
             if not entries:
                 report["error"] = u"узел не найден в полигонах слоя"
                 return report
+            report.update(self._apply_moves(
+                entries, {e["fid"] for e in entries},
+                u"Топологическое перемещение узла", eps))
+        except Exception as exc:
+            try:
+                self.layer.destroyEditCommand()
+            except Exception:
+                pass
+            report["error"] = str(exc)
+        return report
 
-            # габарит всех новых геометрий + запас
-            bbox = None
-            for e in entries:
-                r = polys_bbox(e["polys"])
-                if bbox is None:
-                    bbox = r
-                else:
-                    bbox.combineExtentWith(r)
-            bbox.grow(eps)
+    # ------------------------------------------------------------------
+    # Операция 1б: топологическое перемещение ребра целиком
+    # ------------------------------------------------------------------
 
-            refs, truncated = self._clip_references(
-                bbox, {e["fid"] for e in entries})
-            report["refs"] = len(refs)
-            if truncated:
-                self._push(u"Эталонов для отсечения слишком много "
-                           u"(>{}), часть перехлестов могла остаться. "
-                           u"Уменьшите экстент.".format(MAX_CLIP_REFS),
-                           level=Qgis.Warning, duration=6)
+    def _collect_edge_moved(self, anchors, delta, eps):
+        """Фичи слоя, содержащие хотя бы одну якорную вершину цепочки,
+        с якорями, сдвинутыми на вектор delta.
 
-            self.layer.beginEditCommand(u"Топологическое перемещение узла")
-            for e in entries:
-                g = polys_to_geom(e["polys"], e["multi"])
-                if g.isNull() or g.isEmpty():
-                    report["skipped"] += 1
-                    continue
-                if not g.isGeosValid():
-                    try:
-                        gv = g.makeValid()
-                        if not gv.isNull() and not gv.isEmpty() \
-                                and gv.type() == QgsWkbTypes.PolygonGeometry:
-                            g = gv
-                    except Exception:
-                        pass
+        Полигон, содержащий только часть якорей (примыкание "только
+        концом", как полигон C на вершине общего ребра A и B),
+        смещается этими якорями — топология сохраняется.
 
-                g, clipped_here = self._clip_against_refs(g, refs)
+        :param anchors: [QgsPointXY, ...] — исходные вершины цепочки
+        :param delta: (dx, dy) — вектор переноса (CRS слоя)
+        :param eps: допуск совпадения узлов (единицы CRS слоя)
+        :return: [{"fid", "polys", "multi"}, ...]
+        """
+        dx, dy = delta
+        pad = eps + max(abs(dx), abs(dy))
+        rect = None
+        for p in anchors:
+            r = QgsRectangle(p.x(), p.y(), p.x(), p.y())
+            rect = r if rect is None else rect.combineExtentWith(r)
+        rect.grow(pad)
+        eps2 = eps * eps
+        entries = []
+        req = QgsFeatureRequest(rect)
+        req.setSubsetOfAttributes([])
+        for feat in self.layer.getFeatures(req):
+            nr = norm_polys(feat.geometry())
+            if not nr:
+                continue
+            polys, was_multi = nr
+            new_polys, changed = translate_vertices(polys, anchors, delta,
+                                                    eps2)
+            if changed:
+                entries.append({"fid": feat.id(), "polys": new_polys,
+                                "multi": was_multi})
+        return entries
 
-                if g.isNull() or g.isEmpty():
-                    # полигон полностью поглощён соседями — не меняем
-                    report["skipped"] += 1
-                    continue
-                if self.layer.changeGeometry(e["fid"], g):
-                    report["moved"] += 1
-                    report["clipped"] += clipped_here
-                else:
-                    report["skipped"] += 1
-            self.layer.endEditCommand()
-            self.layer.triggerRepaint()
+    def move_edge(self, anchors, delta, eps):
+        """Перемещает ребро — прямолинейную цепочку вершин — параллельным
+        переносом и отсекает перехлесты.
+
+        Якоря — вершины цепочки (концы и промежуточные, вставленные на
+        ребро). Смещаются во ВСЕХ полигонах редактируемого слоя, где
+        они есть: полигоны с общим ребром двигаются целиком, полигоны,
+        примыкающие только частью якорей, следуют за ними.
+
+        :param anchors: [QgsPointXY, ...] — вершины цепочки (CRS слоя),
+                        минимум две; первая и последняя — концы ребра
+        :param delta: (dx, dy) — вектор переноса (CRS слоя),
+                      уже с прилипанием
+        :param eps: допуск совпадения узлов (единицы CRS слоя)
+        :return: {"moved", "clipped", "skipped", "refs", "error"}
+        """
+        report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0,
+                  "error": None}
+        if not anchors or len(anchors) < 2:
+            report["error"] = u"ребро не задано"
+            return report
+        dx, dy = delta
+        if dx * dx + dy * dy <= 1e-12:
+            report["error"] = u"ребро не смещено"
+            return report
+        if anchors[0].sqrDist(anchors[-1]) <= eps * eps:
+            report["error"] = u"ребро вырождено (короче допуска)"
+            return report
+        try:
+            entries = self._collect_edge_moved(anchors, (dx, dy), eps)
+            if not entries:
+                report["error"] = u"ребро не найдено в полигонах слоя"
+                return report
+            report.update(self._apply_moves(
+                entries, {e["fid"] for e in entries},
+                u"Топологическое перемещение ребра", eps))
         except Exception as exc:
             try:
                 self.layer.destroyEditCommand()

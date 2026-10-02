@@ -159,6 +159,15 @@ def _t_unclamped(p, a, b):
     return ((p.x() - ax) * dx + (p.y() - ay) * dy) / len2
 
 
+def _line_dist2(p, a, b):
+    """Квадрат расстояния от точки p до БЕСКОНЕЧНОЙ прямой ab
+    (в отличие от point_to_segment — без клампа к отрезку)."""
+    t = _t_unclamped(p, a, b)
+    ax, ay = a.x(), a.y()
+    dx, dy = b.x() - ax, b.y() - ay
+    return p.sqrDist(QgsPointXY(ax + t * dx, ay + t * dy))
+
+
 # ---------------------------------------------------------------------------
 # Поиск узлов и рёбер
 # ---------------------------------------------------------------------------
@@ -300,6 +309,94 @@ def insert_vertex_topo(polys, p1, p2, new_pt, eps2):
                     break
         # одно кольцо — не более одной вставки на данное ребро
     return inserted
+
+
+# ---------------------------------------------------------------------------
+# Перемещение ребра (прямолинейной цепочки вершин)
+# ---------------------------------------------------------------------------
+
+def collinear_run(ring, si, eps2):
+    """Максимальная прямолинейная цепочка вершин замкнутого кольца,
+    содержащая сегмент si (между ring[si] и ring[si + 1]).
+
+    Цепочка расширяется в обе стороны, пока соседняя вершина лежит на
+    прямой исходного сегмента в пределах eps. Благодаря этому вершины,
+    вставленные ранее на ребро (в том числе инструментом «Добавить
+    узел на ребре»), не мешают: всё ребро тянется как единое целое и
+    остаётся прямым.
+
+    :param ring: замкнутое кольцо (список QgsPointXY)
+    :param si: индекс сегмента в кольце
+    :param eps2: квадрат допуска коллинеарности (единицы слоя)
+    :return: [QgsPointXY, ...] — вершины цепочки по порядку (всегда >= 2)
+    """
+    n = len(ring)
+    m = n - 1 if n > 1 and ring[0].sqrDist(ring[-1]) <= DUP_EPS2 else n
+    if m < 2:
+        return [QgsPointXY(ring[0])]
+    a = ring[si % m]
+    b = ring[(si + 1) % m]
+
+    start = si % m
+    end = (si + 1) % m
+    while end != start:
+        nxt = (end + 1) % m
+        if nxt == start:
+            break
+        if _line_dist2(ring[nxt], a, b) > eps2:
+            break
+        end = nxt
+    while end != start:
+        prv = (start - 1) % m
+        if prv == end:
+            break
+        if _line_dist2(ring[prv], a, b) > eps2:
+            break
+        start = prv
+
+    pts = [ring[start]]
+    idx = start
+    while idx != end:
+        idx = (idx + 1) % m
+        pts.append(ring[idx])
+    return pts
+
+
+def translate_vertices(polys, anchors, delta, eps2):
+    """Сдвигает ВСЕ вершины, совпадающие с любой из anchors (в пределах
+    eps), на вектор delta.
+
+    Однопроходная замена (в отличие от цепочки replace_vertices):
+    результат не зависит от порядка обхода, промежуточные вершины
+    цепочки не искажаются, замыкающие дубликаты сдвигаются согласованно.
+
+    :param polys: нормализованная структура (не изменяется)
+    :param anchors: [QgsPointXY, ...] — «якорные» вершины цепочки
+    :param delta: (dx, dy) — вектор переноса
+    :param eps2: квадрат допуска совпадения вершин
+    :return: (new_polys, changed_count)
+    """
+    dx, dy = delta
+    new_polys = []
+    changed = 0
+    for part in polys:
+        new_part = []
+        for ring in part:
+            new_ring = []
+            for v in ring:
+                hit = False
+                for m in anchors:
+                    if v.sqrDist(m) <= eps2:
+                        hit = True
+                        break
+                if hit:
+                    new_ring.append(QgsPointXY(v.x() + dx, v.y() + dy))
+                    changed += 1
+                else:
+                    new_ring.append(QgsPointXY(v))
+            new_part.append(new_ring)
+        new_polys.append(new_part)
+    return new_polys, changed
 
 
 # ---------------------------------------------------------------------------
