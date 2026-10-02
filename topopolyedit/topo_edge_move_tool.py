@@ -22,7 +22,8 @@ from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
                        Qgis, QgsFeatureRequest)
 
 from .geo_utils import (norm_polys, polys_to_geom, collinear_run,
-                        translate_vertices, find_segment, contains_vertex)
+                        translate_vertices, find_segment, contains_vertex,
+                        points_bbox)
 from .snapping_engine import SnappingEngine, get_snap_layers
 from .topo_editor import TopoEditor
 from . import utils
@@ -142,10 +143,9 @@ class TopoEdgeMoveTool(QgsMapTool):
 
     def _collect_edge_set(self, layer, anchors, eps):
         """Все фичи слоя, содержащие хотя бы одну якорную вершину."""
-        rect = None
-        for p in anchors:
-            r = QgsRectangle(p.x(), p.y(), p.x(), p.y())
-            rect = r if rect is None else rect.combineExtentWith(r)
+        rect = points_bbox(anchors)
+        if rect is None:
+            return []  # пустые якоря — искать нечего
         rect.grow(eps)
         eps2 = eps * eps
         entries = []

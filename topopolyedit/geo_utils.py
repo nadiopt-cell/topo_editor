@@ -420,3 +420,22 @@ def polys_bbox(polys):
     if minx is None:
         return QgsRectangle()
     return QgsRectangle(minx, miny, maxx, maxy)
+
+
+def points_bbox(points):
+    """Габаритный прямоугольник списка точек; None, если список пуст.
+
+    ВАЖНО: QgsRectangle.combineExtentWith() изменяет прямоугольник НА
+    МЕСТЕ и возвращает None (в C++ это void-метод). Конструкция вида
+    ``rect = rect.combineExtentWith(r)`` обнуляет rect и приводит к
+    ``'NoneType' object has no attribute 'grow'`` на следующем шаге.
+    Поэтому возвращаемое значение здесь игнорируется.
+    """
+    rect = None
+    for p in points:
+        r = QgsRectangle(p.x(), p.y(), p.x(), p.y())
+        if rect is None:
+            rect = r
+        else:
+            rect.combineExtentWith(r)
+    return rect

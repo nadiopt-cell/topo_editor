@@ -87,6 +87,43 @@ class QgsWkbTypes(object):
     NullGeometry = 3
 
 
+class QgsFeatureRequest(object):
+    def __init__(self, rect=None):
+        self.rect = rect
+
+    def setSubsetOfAttributes(self, names):
+        pass
+
+
+class QgsProject(object):
+    @staticmethod
+    def instance():
+        return None
+
+
+class QgsCoordinateTransform(object):
+    pass
+
+
+class QgsUnitTypes(object):
+    pass
+
+
+class QgsMapLayerType(object):
+    pass
+
+
+class QgsVectorLayer(object):
+    pass
+
+
+class Qgis(object):
+    Info = 0
+    Warning = 1
+    Critical = 2
+    Success = 3
+
+
 class QgsGeometry(object):
     def __init__(self, src=None):
         self._data = None
@@ -143,6 +180,14 @@ core_mod.QgsPointXY = QgsPointXY
 core_mod.QgsRectangle = QgsRectangle
 core_mod.QgsWkbTypes = QgsWkbTypes
 core_mod.QgsGeometry = QgsGeometry
+# имена, нужные для импорта topopolyedit.topo_editor (см. секцию 16)
+core_mod.QgsFeatureRequest = QgsFeatureRequest
+core_mod.QgsProject = QgsProject
+core_mod.QgsCoordinateTransform = QgsCoordinateTransform
+core_mod.QgsUnitTypes = QgsUnitTypes
+core_mod.QgsMapLayerType = QgsMapLayerType
+core_mod.QgsVectorLayer = QgsVectorLayer
+core_mod.Qgis = Qgis
 
 sys.modules["qgis"] = qgis_mod
 sys.modules["qgis.core"] = core_mod
@@ -464,6 +509,86 @@ check("move ребра: исходные структуры A/B/C не изме�
       abs(polys_ea[0][0][2].x() - 2.0) < 1e-12 and
       abs(polys_eb[0][0][0].x() - 2.0) < 1e-12 and
       abs(polys_ec[0][0][0].x() - 2.0) < 1e-12)
+
+# ---------------------------------------------------------------------------
+# 16. points_bbox + регрессия «'NoneType' object has no attribute 'grow'»
+#     В v1.1.0 было: rect = rect.combineExtentWith(r) — но combineExtentWith
+#     в PyQGIS меняет прямоугольник на месте и ВОЗВРАЩАЕТ None (void),
+#     поэтому при 2+ якорях rect обнулялся и rect.grow(...) падал.
+#     Регрессия ловится на TopoEditor._collect_edge_moved с 2+ якорями.
+# ---------------------------------------------------------------------------
+rb0 = gu.points_bbox([])
+check("points_bbox: пустой список -> None", rb0 is None)
+
+rb1 = gu.points_bbox([pt(3, 7)])
+check("points_bbox: одна точка",
+      rb1 is not None and abs(rb1.xmin - 3.0) < 1e-9 and
+      abs(rb1.ymin - 7.0) < 1e-9 and abs(rb1.xmax - 3.0) < 1e-9 and
+      abs(rb1.ymax - 7.0) < 1e-9)
+
+rb3 = gu.points_bbox([pt(2, 0), pt(5, 4), pt(1, 6)])
+check("points_bbox: границы трёх точек",
+      abs(rb3.xmin - 1.0) < 1e-9 and abs(rb3.ymin - 0.0) < 1e-9 and
+      abs(rb3.xmax - 5.0) < 1e-9 and abs(rb3.ymax - 6.0) < 1e-9)
+rb3.grow(1.0)
+check("points_bbox: grow после накопления работает",
+      abs(rb3.xmin - 0.0) < 1e-9 and abs(rb3.ymax - 7.0) < 1e-9)
+
+# стаб обязан повторять семантику реального PyQGIS:
+# изменение на месте + возврат None (иначе стаб снова замаскирует баг)
+r_a = QgsRectangle(0, 0, 1, 1)
+_ret = r_a.combineExtentWith(QgsRectangle(2, 2, 3, 3))
+check("стаб QgsRectangle: combineExtentWith меняет на месте и возвращает None",
+      _ret is None and abs(r_a.xmax - 3.0) < 1e-9 and abs(r_a.ymax - 3.0) < 1e-9)
+
+# --- регрессия: _collect_edge_moved с 2+ якорями (падало в v1.1.0) ---
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import topopolyedit.topo_editor as te  # noqa: E402
+
+
+class _Feat(object):
+    def __init__(self, fid, geom):
+        self._fid = fid
+        self._g = geom
+
+    def id(self):
+        return self._fid
+
+    def geometry(self):
+        return self._g
+
+
+class _Layer(object):
+    def __init__(self, feats):
+        self._feats = feats
+
+    def getFeatures(self, req):
+        return list(self._feats)
+
+
+gA = QgsGeometry.fromPolygonXY([ring((0, 0), (2, 0), (2, 2), (2, 4), (0, 4))])
+gB = QgsGeometry.fromPolygonXY([ring((2, 0), (5, 0), (5, 4), (2, 4), (2, 2))])
+gC = QgsGeometry.fromPolygonXY([ring((2, 4), (4, 4), (4, 6), (2, 6))])
+lay = _Layer([_Feat(1, gA), _Feat(2, gB), _Feat(3, gC)])
+ed = te.TopoEditor(None, lay)
+
+entries = ed._collect_edge_moved([pt(2, 0), pt(2, 2), pt(2, 4)], (1, 0), 1.0)
+check("collect_edge_moved: 3 якоря — нет AttributeError, найдены все фичи",
+      len(entries) == 3 and sorted(e["fid"] for e in entries) == [1, 2, 3])
+
+ent_a = [e for e in entries if e["fid"] == 1][0]
+check("collect_edge_moved: A сместилась целиком, граница прямая",
+      ent_a["multi"] is False and
+      [(p.x(), p.y()) for p in ent_a["polys"][0][0]] ==
+      [(0, 0), (3, 0), (3, 2), (3, 4), (0, 4), (0, 0)])
+
+ent_c = [e for e in entries if e["fid"] == 3][0]
+check("collect_edge_moved: C следует за концом (2,4)",
+      [(p.x(), p.y()) for p in ent_c["polys"][0][0]] ==
+      [(3, 4), (4, 4), (4, 6), (2, 6), (3, 4)])
+
+check("collect_edge_moved: пустые якоря -> [] без падения",
+      ed._collect_edge_moved([], (1, 0), 1.0) == [])
 
 # ---------------------------------------------------------------------------
 print("")

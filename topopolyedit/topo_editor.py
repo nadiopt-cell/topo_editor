@@ -19,7 +19,7 @@ from qgis.core import (
 
 from .geo_utils import (
     norm_polys, polys_to_geom, replace_vertices, insert_vertex_topo,
-    polys_bbox, contains_vertex, translate_vertices,
+    polys_bbox, points_bbox, contains_vertex, translate_vertices,
 )
 from .snapping_engine import get_snap_layers
 
@@ -169,6 +169,8 @@ class TopoEditor(object):
         report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0}
 
         # габарит всех новых геометрий + запас
+        # (combineExtentWith меняет bbox на месте и возвращает None —
+        # возвращаемое значение использовать нельзя)
         bbox = None
         for e in entries:
             r = polys_bbox(e["polys"])
@@ -176,6 +178,8 @@ class TopoEditor(object):
                 bbox = r
             else:
                 bbox.combineExtentWith(r)
+        if bbox is None:
+            return report  # пустой список — нечего двигать и отсекать
         bbox.grow(eps)
 
         refs, truncated = self._clip_references(bbox, exclude_ids)
@@ -269,10 +273,9 @@ class TopoEditor(object):
         """
         dx, dy = delta
         pad = eps + max(abs(dx), abs(dy))
-        rect = None
-        for p in anchors:
-            r = QgsRectangle(p.x(), p.y(), p.x(), p.y())
-            rect = r if rect is None else rect.combineExtentWith(r)
+        rect = points_bbox(anchors)
+        if rect is None:
+            return []  # пустые якоря — искать нечего
         rect.grow(pad)
         eps2 = eps * eps
         entries = []
