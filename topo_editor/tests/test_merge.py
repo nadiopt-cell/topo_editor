@@ -1,14 +1,28 @@
 import unittest
 
-from topo_graph_editor.core.graph import build_graph
-from topo_graph_editor.core.ops import (
-    CROSSES_OTHER_FACE,
-    MERGE_SAME_FACE,
-    find_snap_target,
-    nearest_vertex,
-    plan_vertex_move,
-)
-from topo_graph_editor.tests.test_graph import square
+try:  # внутри QGIS папка плагина может называться topo_editor
+    from topo_editor.core.graph import build_graph
+    from topo_editor.core.ops import (
+        CROSSES_OTHER_FACE,
+        MERGE_SAME_FACE,
+        find_snap_target,
+        nearest_vertex,
+        plan_vertex_move,
+    )
+except ImportError:
+    from topo_editor.core.graph import build_graph
+    from topo_editor.core.ops import (
+        CROSSES_OTHER_FACE,
+        MERGE_SAME_FACE,
+        find_snap_target,
+        nearest_vertex,
+        plan_vertex_move,
+    )
+
+try:
+    from topo_editor.tests.test_graph import square
+except ImportError:
+    from topo_editor.tests.test_graph import square
 
 TOL = 0.001
 

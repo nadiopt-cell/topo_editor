@@ -1,10 +1,10 @@
-# topo_graph_editor — плагин QGIS (ГГИС-топология)
+# topo_editor — плагин QGIS (ГГИС-топология)
 
 Топологический редактор полигональных слоёв: перемещение вершин с сохранением общей границы соседних участков + **добавление нового вертекса на ребро**.
 
 ## Установка
-1. Скачайте zip репозитория (Code → Download ZIP) или соберите архив папки `topo_graph_editor`.
-2. В QGIS: Модули → Установить модуль из zip, либо распакуйте папку `topo_graph_editor` в каталог плагинов (`Profile → python → plugins`).
+1. Скачайте zip репозитория (Code → Download ZIP) или соберите архив папки `topo_editor`.
+2. В QGIS: Модули → Установить модуль из zip, либо распакуйте папку `topo_editor` в каталог плагинов (`Profile → python → plugins`). ВАЖНО: папка плагина должна называться `topo_editor` (так же, как модуль пакета).
 3. Перезапустите QGIS, включите модуль «Topo Graph Editor».
 
 ## Использование
@@ -15,9 +15,9 @@
 
 ## Тесты
 ```
-python -m unittest discover -s topo_graph_editor/tests -t .
+python -m unittest discover -s topo_editor/tests -t .
 ```
 (ядро `core/` не требует QGIS; 36 тестов)
 
 ## Иконка
-`topo_graph_editor/icons/icon.svg` (+ PNG-фолбэк), указана в `metadata.txt`.
+`topo_editor/icons/icon.svg` (+ PNG-фолбэк), указана в `metadata.txt`.

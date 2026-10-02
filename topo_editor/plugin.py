@@ -7,10 +7,15 @@ import os
 from .map_tool import GraphInspectTool
 from .vertex_move_tool import VertexMoveTool
 
-SETTINGS_KEY = "topo_graph_editor/tolerance"
+try:  # имя пакета = имя папки плагина (в QGIS это может быть topo_editor)
+    PACKAGE_NAME = (__package__ or "topo_editor").split(".")[0]
+except Exception:
+    PACKAGE_NAME = "topo_editor"
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_KEY = PACKAGE_NAME + "/tolerance"
 DEFAULT_TOLERANCE = 0.01  # в единицах СК слоя (для проекции в метрах - 1 см)
 MENU = "&Topo Graph Editor"
-ICON_PATH = os.path.join(os.path.dirname(__file__), "icons", "icon.svg")
+ICON_PATH = os.path.join(PLUGIN_DIR, "icons", "icon.svg")
 
 
 class TopoGraphEditorPlugin:

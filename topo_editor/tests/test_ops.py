@@ -1,13 +1,23 @@
 import unittest
 
-from topo_graph_editor.core.graph import build_graph
-from topo_graph_editor.core.ops import (
-    CROSSES_OTHER_FACE,
-    SELF_INTERSECTION,
-    nearest_vertex,
-    plan_vertex_move,
-)
-from topo_graph_editor.tests.test_graph import grid2x2, square
+try:  # внутри QGIS папка плагина может называться topo_editor
+    from topo_editor.core.graph import build_graph
+    from topo_editor.core.ops import (
+        CROSSES_OTHER_FACE,
+        SELF_INTERSECTION,
+        nearest_vertex,
+        plan_vertex_move,
+    )
+    from topo_editor.tests.test_graph import grid2x2, square
+except ImportError:
+    from topo_editor.core.graph import build_graph
+    from topo_editor.core.ops import (
+        CROSSES_OTHER_FACE,
+        SELF_INTERSECTION,
+        nearest_vertex,
+        plan_vertex_move,
+    )
+    from topo_editor.tests.test_graph import grid2x2, square
 
 TOL = 0.001
 

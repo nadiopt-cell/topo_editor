@@ -1,6 +1,9 @@
 import unittest
 
-from topo_graph_editor.core.graph import build_graph
+try:  # внутри QGIS папка плагина может называться topo_editor
+    from topo_editor.core.graph import build_graph
+except ImportError:
+    from topo_editor.core.graph import build_graph
 
 
 def square(x0, y0, x1, y1):
