@@ -16,30 +16,34 @@ def is_polygon_layer(layer):
             and layer.geometryType() == QgsWkbTypes.PolygonGeometry)
 
 
-def resolve_edit_layer(iface, offer_start=True, quiet=False):
-    """Определяет редактируемый полигональный слой.
+def resolve_edit_layers(iface, offer_start=True, quiet=False):
+    """Список редактируемых полигональных слоёв в порядке приоритета.
 
-    Порядок: активный слой в режиме редактирования -> единственный слой
-    проекта в режиме редактирования -> предложение включить редактирование
-    активного слоя.
+    Первый элемент — активный слой, если он в правке. Если активный слой
+    не в правке, а редактируемые полигональные слои есть — возвращаются
+    ВСЕ они: инструмент выберет тот, под курсором которого найден узел
+    или ребро (иначе при нескольких слоях в правке инструмент искал
+    не в том слое и ошибочно сообщал «нет узла»). Если редактируемых
+    слоёв нет — предлагается включить правку активного полигонального
+    слоя (кроме quiet-режима).
 
     :param offer_start: предлагать ли включить редактирование диалогом
     :param quiet: не показывать никаких диалогов и сообщений (для hover)
-    :return: QgsVectorLayer или None
+    :return: [QgsVectorLayer, ...] — может быть пустым
     """
     layer = iface.activeLayer()
     if is_polygon_layer(layer) and layer.isEditable():
-        return layer
+        return [layer]
 
     edited = [l for l in QgsProject.instance().mapLayers().values()
               if is_polygon_layer(l) and l.isEditable()]
-    if len(edited) == 1:
-        return edited[0]
+    if edited:
+        return edited
 
     if quiet:
-        return None
+        return []
 
-    if is_polygon_layer(layer) and not layer.isEditable() and offer_start:
+    if is_polygon_layer(layer) and offer_start:
         ans = QMessageBox.question(
             iface.mainWindow(),
             u"Топологическое редактирование",
@@ -48,15 +52,25 @@ def resolve_edit_layer(iface, offer_start=True, quiet=False):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if ans == QMessageBox.Yes:
             layer.startEditing()
-            return layer
-        return None
+            return [layer]
+        return []
 
     iface.messageBar().pushMessage(
         u"Топологическое редактирование",
         u"Включите режим редактирования полигонального слоя "
         u"и сделайте его активным.",
         level=Qgis.Warning, duration=5)
-    return None
+    return []
+
+
+def resolve_edit_layer(iface, offer_start=True, quiet=False):
+    """Первый редактируемый полигональный слой (см. resolve_edit_layers).
+
+    :return: QgsVectorLayer или None
+    """
+    layers = resolve_edit_layers(iface, offer_start=offer_start,
+                                 quiet=quiet)
+    return layers[0] if layers else None
 
 
 def layer_tolerance(canvas, layer, map_pt):

@@ -327,6 +327,63 @@ check("polys_bbox: габариты A", abs(bb.xmin) < 1e-9 and abs(bb.ymin) < 1
       abs(bb.xmax - 2.0) < 1e-9 and abs(bb.ymax - 4.0) < 1e-9)
 
 # ---------------------------------------------------------------------------
+# 12. Криволинейная геометрия: segmentize-фолбэк в norm_polys / iter_polyline_parts
+# ---------------------------------------------------------------------------
+real_poly = QgsGeometry.fromPolygonXY([ring((0, 0), (1, 0), (1, 1), (0, 1))])
+
+
+class _CurveSeg(object):
+    """Стаб QgsAbstractGeometry с сегментацией."""
+    def __init__(self, flat):
+        self._flat = flat
+
+    def segmentize(self):
+        return self._flat
+
+
+class CurvePolygonStub(QgsGeometry):
+    """Стаб CurvePolygon: asPolygon() пуст, сегментация даёт полигон."""
+    def __init__(self, flat):
+        super(CurvePolygonStub, self).__init__(flat)
+        self._flat = flat
+
+    def asPolygon(self):
+        return []  # как у реального CurvePolygon
+
+    def constGet(self):
+        return _CurveSeg(self._flat)
+
+
+curve = CurvePolygonStub(real_poly)
+nrc = gu.norm_polys(curve)
+check("norm_polys: CurvePolygon сегментируется",
+      nrc is not None and nrc[1] is False and len(nrc[0]) == 1 and
+      len(nrc[0][0][0]) == 5)
+r = gu.find_vertex(nrc[0], pt(1, 1), 0.1)
+check("find_vertex: узел найден в сегментированной кривой",
+      r is not None and abs(r[0].x() - 1.0) < 1e-9)
+
+real_line = QgsGeometry.fromPolylineXY([pt(0, 0), pt(1, 0), pt(1, 1)])
+
+
+class CurveLineStub(QgsGeometry):
+    """Стаб CurveLine: asPolyline() пуст, сегментация даёт линию."""
+    def __init__(self, flat):
+        super(CurveLineStub, self).__init__(flat)
+        self._flat = flat
+
+    def asPolyline(self):
+        return []
+
+    def constGet(self):
+        return _CurveSeg(self._flat)
+
+
+parts = gu.iter_polyline_parts(CurveLineStub(real_line))
+check("iter_polyline_parts: CurveLine сегментируется",
+      len(parts) == 1 and len(parts[0]) == 3)
+
+# ---------------------------------------------------------------------------
 print("")
 if FAILURES:
     print("ИТОГ: ПРОВАЛЕНО тестов: %d -> %s" % (len(FAILURES), FAILURES))

@@ -15,7 +15,7 @@ from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
                        Qgis, QgsFeatureRequest)
 
 from .geo_utils import norm_polys, find_segment, point_to_segment
-from .snapping_engine import SnappingEngine
+from .snapping_engine import SnappingEngine, get_snap_layers
 from .topo_editor import TopoEditor
 from . import utils
 
@@ -67,35 +67,42 @@ class TopoAddVertexTool(QgsMapTool):
 
     # ------------------------------------------------------------------
     def _find_segment(self, layer, pt_layer, eps):
-        """Ближайшее ребро слоя к точке (CRS слоя) в пределах eps."""
+        """Ближайшее ребро слоя к точке (CRS слоя) в пределах eps.
+
+        Ошибки чтения данных НЕ проглатываются — они поднимаются выше,
+        чтобы инструмент показал настоящую причину, а не «нет ребра».
+        """
         rect = QgsRectangle(pt_layer.x() - eps, pt_layer.y() - eps,
                             pt_layer.x() + eps, pt_layer.y() + eps)
         best = None
-        try:
-            req = QgsFeatureRequest(rect)
-            req.setSubsetOfAttributes([])
-            for feat in layer.getFeatures(req):
-                nr = norm_polys(feat.geometry())
-                if not nr:
-                    continue
-                r = find_segment(nr[0], pt_layer, eps * eps)
-                if r is not None and (best is None or r[6] < best[6]):
-                    best = r
-        except Exception:
-            return None
+        req = QgsFeatureRequest(rect)
+        req.setSubsetOfAttributes([])
+        for feat in layer.getFeatures(req):
+            nr = norm_polys(feat.geometry())
+            if not nr:
+                continue
+            r = find_segment(nr[0], pt_layer, eps * eps)
+            if r is not None and (best is None or r[6] < best[6]):
+                best = r
         return best
 
     def canvasMoveEvent(self, e):
         self._cleanup()
-        layer = utils.resolve_edit_layer(self.iface, quiet=True)
-        if layer is None:
+        candidates = utils.resolve_edit_layers(self.iface, quiet=True)
+        if not candidates:
             return
-        try:
-            pt_layer, eps, _ct_m2l, ct_l2m = utils.layer_tolerance(
-                self.canvas(), layer, e.mapPoint())
-        except Exception:
-            return
-        seg = self._find_segment(layer, pt_layer, eps)
+        map_pt = e.mapPoint()
+        seg = None
+        ct_l2m = None
+        for layer in candidates:
+            try:
+                pt_layer, eps, _ct_m2l, ct_l2m = utils.layer_tolerance(
+                    self.canvas(), layer, map_pt)
+                seg = self._find_segment(layer, pt_layer, eps)
+            except Exception:
+                continue
+            if seg is not None:
+                break
         if seg is None:
             return
         _pi, _ri, _si, a, b, proj, _d2 = seg
@@ -109,22 +116,58 @@ class TopoAddVertexTool(QgsMapTool):
         self.marker.setCenter(pm)
         self.marker.show()
 
+    def _no_edge_message(self, candidates, map_pt):
+        """Понятное сообщение: в каких слоях искали и что делать."""
+        bar = self.iface.messageBar()
+        edit_ids = {l.id() for l in candidates}
+        for lyr in get_snap_layers(None):
+            if not utils.is_polygon_layer(lyr) or lyr.isEditable() \
+                    or lyr.id() in edit_ids:
+                continue
+            try:
+                pt_layer, eps, _m2l, _l2m = utils.layer_tolerance(
+                    self.canvas(), lyr, map_pt)
+                found = self._find_segment(lyr, pt_layer, eps)
+            except Exception:
+                continue
+            if found is not None:
+                bar.pushMessage(
+                    u"Топологическое редактирование",
+                    u"Ребро есть в слое «{}», но этот слой не находится "
+                    u"в режиме редактирования. Включите правку "
+                    u"(карандаш) и повторите.".format(lyr.name()),
+                    level=Qgis.Warning, duration=6)
+                return
+        names = u", ".join(u"«{}»".format(l.name()) for l in candidates) \
+            if candidates else u"—"
+        bar.pushMessage(
+            u"Топологическое редактирование",
+            u"Рядом с курсором нет ребра редактируемого слоя "
+            u"(поиск по: {}).".format(names),
+            level=Qgis.Info, duration=4)
+
     def canvasPressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
         try:
-            layer = utils.resolve_edit_layer(self.iface, offer_start=True)
-            if layer is None:
+            candidates = utils.resolve_edit_layers(self.iface,
+                                                   offer_start=True)
+            if not candidates:
                 return
             map_pt = e.mapPoint()
-            pt_layer, eps, ct_m2l, _ct_l2m = utils.layer_tolerance(
-                self.canvas(), layer, map_pt)
-            seg = self._find_segment(layer, pt_layer, eps)
+            seg = None
+            layer = None
+            eps = ct_m2l = None
+            for lyr in candidates:
+                pt_layer, eps, ct_m2l, _ct_l2m = utils.layer_tolerance(
+                    self.canvas(), lyr, map_pt)
+                s = self._find_segment(lyr, pt_layer, eps)
+                if s is not None:
+                    seg = s
+                    layer = lyr
+                    break
             if seg is None:
-                self.iface.messageBar().pushMessage(
-                    u"Топологическое редактирование",
-                    u"Рядом с курсором нет ребра редактируемого слоя.",
-                    level=Qgis.Info, duration=2)
+                self._no_edge_message(candidates, map_pt)
                 return
             _pi, _ri, _si, a, b, _proj, _d2 = seg
 

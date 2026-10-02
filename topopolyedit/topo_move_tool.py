@@ -16,7 +16,7 @@ from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
 
 from .geo_utils import (norm_polys, polys_to_geom, replace_vertices,
                         find_vertex, contains_vertex)
-from .snapping_engine import SnappingEngine
+from .snapping_engine import SnappingEngine, get_snap_layers
 from .topo_editor import TopoEditor
 from . import utils
 
@@ -71,22 +71,23 @@ class TopoMoveTool(QgsMapTool):
             pass
 
     def _find_vertex(self, layer, pt_layer, eps):
-        """Ближайший узел слоя к точке (CRS слоя) в пределах eps."""
+        """Ближайший узел слоя к точке (CRS слоя) в пределах eps.
+
+        Ошибки чтения данных НЕ проглатываются — они поднимаются выше,
+        чтобы инструмент показал настоящую причину, а не «нет узла».
+        """
         rect = QgsRectangle(pt_layer.x() - eps, pt_layer.y() - eps,
                             pt_layer.x() + eps, pt_layer.y() + eps)
         best = None
-        try:
-            req = QgsFeatureRequest(rect)
-            req.setSubsetOfAttributes([])
-            for feat in layer.getFeatures(req):
-                nr = norm_polys(feat.geometry())
-                if not nr:
-                    continue
-                r = find_vertex(nr[0], pt_layer, eps * eps)
-                if r is not None and (best is None or r[1] < best[1]):
-                    best = (r[0], r[1])
-        except Exception:
-            return None
+        req = QgsFeatureRequest(rect)
+        req.setSubsetOfAttributes([])
+        for feat in layer.getFeatures(req):
+            nr = norm_polys(feat.geometry())
+            if not nr:
+                continue
+            r = find_vertex(nr[0], pt_layer, eps * eps)
+            if r is not None and (best is None or r[1] < best[1]):
+                best = (r[0], r[1])
         return best[0] if best is not None else None
 
     def _collect_move_set(self, layer, picked, eps):
@@ -94,19 +95,16 @@ class TopoMoveTool(QgsMapTool):
         rect = QgsRectangle(picked.x() - eps, picked.y() - eps,
                             picked.x() + eps, picked.y() + eps)
         entries = []
-        try:
-            req = QgsFeatureRequest(rect)
-            req.setSubsetOfAttributes([])
-            for feat in layer.getFeatures(req):
-                nr = norm_polys(feat.geometry())
-                if not nr:
-                    continue
-                polys, was_multi = nr
-                if contains_vertex(polys, picked, eps * eps):
-                    entries.append({"fid": feat.id(), "polys": polys,
-                                    "multi": was_multi})
-        except Exception:
-            pass
+        req = QgsFeatureRequest(rect)
+        req.setSubsetOfAttributes([])
+        for feat in layer.getFeatures(req):
+            nr = norm_polys(feat.geometry())
+            if not nr:
+                continue
+            polys, was_multi = nr
+            if contains_vertex(polys, picked, eps * eps):
+                entries.append({"fid": feat.id(), "polys": polys,
+                                "multi": was_multi})
         return entries
 
     # ------------------------------------------------------------------
@@ -132,22 +130,64 @@ class TopoMoveTool(QgsMapTool):
             return
         super(TopoMoveTool, self).keyPressEvent(e)
 
+    def _no_vertex_message(self, candidates, map_pt):
+        """Понятное сообщение: в каких слоях искали и что делать.
+
+        Если рядом с курсором есть узел полигонального слоя, НЕ
+        находящегося в правке, — подсказка включить редактирование.
+        """
+        bar = self.iface.messageBar()
+        edit_ids = {l.id() for l in candidates}
+        for lyr in get_snap_layers(None):
+            if not utils.is_polygon_layer(lyr) or lyr.isEditable() \
+                    or lyr.id() in edit_ids:
+                continue
+            try:
+                pt_layer, eps, _m2l, _l2m = utils.layer_tolerance(
+                    self.canvas(), lyr, map_pt)
+                found = self._find_vertex(lyr, pt_layer, eps)
+            except Exception:
+                continue
+            if found is not None:
+                bar.pushMessage(
+                    u"Топологическое редактирование",
+                    u"Узел есть в слое «{}», но этот слой не находится "
+                    u"в режиме редактирования. Включите правку "
+                    u"(карандаш) и повторите.".format(lyr.name()),
+                    level=Qgis.Warning, duration=6)
+                return
+        names = u", ".join(u"«{}»".format(l.name()) for l in candidates) \
+            if candidates else u"—"
+        bar.pushMessage(
+            u"Топологическое редактирование",
+            u"Рядом с курсором нет узла редактируемого слоя "
+            u"(поиск по: {}).".format(names),
+            level=Qgis.Info, duration=4)
+
     def canvasPressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
         try:
-            layer = utils.resolve_edit_layer(self.iface, offer_start=True)
-            if layer is None:
+            candidates = utils.resolve_edit_layers(self.iface,
+                                                   offer_start=True)
+            if not candidates:
                 return
             map_pt = e.mapPoint()
-            pt_layer, eps, ct_m2l, ct_l2m = utils.layer_tolerance(
-                self.canvas(), layer, map_pt)
-            picked = self._find_vertex(layer, pt_layer, eps)
+            picked = None
+            layer = None
+            pt_layer = eps = ct_m2l = ct_l2m = None
+            # первый кандидат — активный слой; далее остальные
+            # редактируемые: побеждает слой, под курсором которого есть узел
+            for lyr in candidates:
+                pt_layer, eps, ct_m2l, ct_l2m = utils.layer_tolerance(
+                    self.canvas(), lyr, map_pt)
+                v = self._find_vertex(lyr, pt_layer, eps)
+                if v is not None:
+                    picked = v
+                    layer = lyr
+                    break
             if picked is None:
-                self.iface.messageBar().pushMessage(
-                    u"Топологическое редактирование",
-                    u"Рядом с курсором нет узла редактируемого слоя.",
-                    level=Qgis.Info, duration=2)
+                self._no_vertex_message(candidates, map_pt)
                 return
             entries = self._collect_move_set(layer, picked, eps)
             if not entries:
@@ -218,22 +258,21 @@ class TopoMoveTool(QgsMapTool):
     # ------------------------------------------------------------------
 
     def _update_hover(self, map_pt):
-        """Показ узла, который будет перемещён."""
-        layer = utils.resolve_edit_layer(self.iface, quiet=True)
-        if layer is None:
-            self.hover_marker.hide()
-            return
-        try:
-            pt_layer, eps, _ct_m2l, ct_l2m = utils.layer_tolerance(
-                self.canvas(), layer, map_pt)
-            picked = self._find_vertex(layer, pt_layer, eps)
+        """Показ узла, который будет перемещён (любой редактируемый слой)."""
+        self.hover_marker.hide()
+        candidates = utils.resolve_edit_layers(self.iface, quiet=True)
+        for layer in candidates:
+            try:
+                pt_layer, eps, _ct_m2l, ct_l2m = utils.layer_tolerance(
+                    self.canvas(), layer, map_pt)
+                picked = self._find_vertex(layer, pt_layer, eps)
+            except Exception:
+                continue
             if picked is None:
-                self.hover_marker.hide()
-                return
+                continue
             self.hover_marker.setCenter(ct_l2m.transform(picked))
             self.hover_marker.show()
-        except Exception:
-            self.hover_marker.hide()
+            return
 
     def _update_preview(self, map_pt, snap):
         """Резиновые ленты всех перемещаемых полигонов."""

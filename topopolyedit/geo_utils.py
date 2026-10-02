@@ -23,20 +23,51 @@ DUP_EPS2 = 1e-12
 # Нормализация / сборка геометрии
 # ---------------------------------------------------------------------------
 
+def _poly_parts(geom):
+    """QgsGeometry -> (polys, was_multi) без обработки кривых."""
+    if geom.isMultipart():
+        return geom.asMultiPolygon(), True
+    return [geom.asPolygon()], False
+
+
+def _polys_have_rings(polys):
+    """True, если в структуре есть хотя бы одно непустое кольцо."""
+    return any(len(ring) > 0 for part in polys for ring in part)
+
+
+def _segmentized(geom):
+    """Сегментация криволинейной геометрии (CurvePolygon/CompoundCurve).
+
+    :return: QgsGeometry с прямолинейными сегментами или None при ошибке.
+    """
+    try:
+        flat = QgsGeometry(geom.constGet().segmentize())
+        if flat.isNull() or flat.isEmpty():
+            return None
+        return flat
+    except Exception:
+        return None
+
+
 def norm_polys(geom):
     """QgsGeometry -> (polys, was_multi) или None, если геометрия пустая
-    или не является полигоном/мультиполигоном."""
+    или не является полигоном/мультиполигоном.
+
+    Криволинейные полигоны (CurvePolygon) предварительно сегментируются:
+    asPolygon() для них возвращает пустой список, что ранее приводило к
+    тихому пропуску геометрии при поиске узлов и рёбер."""
     if geom is None or geom.isNull() or geom.isEmpty():
         return None
     if geom.type() != QgsWkbTypes.PolygonGeometry:
         return None
-    if geom.isMultipart():
-        polys = geom.asMultiPolygon()
-        was_multi = True
-    else:
-        polys = [geom.asPolygon()]
-        was_multi = False
-    if not polys:
+    polys, was_multi = _poly_parts(geom)
+    if not _polys_have_rings(polys):
+        flat = _segmentized(geom)
+        if flat is not None:
+            polys2, was_multi2 = _poly_parts(flat)
+            if _polys_have_rings(polys2):
+                polys, was_multi = polys2, was_multi2
+    if not _polys_have_rings(polys):
         return None
     return polys, was_multi
 
@@ -64,18 +95,26 @@ def iter_ring_segments(ring):
 
 def iter_polyline_parts(geom):
     """Список линий (каждая — список QgsPointXY) для линейной геометрии.
-    Для нелинейной геометрии возвращает пустой список."""
+    Криволинейные линии предварительно сегментируются; если разобрать
+    геометрию не удалось, возвращает пустой список."""
     if geom is None or geom.isNull() or geom.isEmpty():
         return []
     if geom.type() != QgsWkbTypes.LineGeometry:
         return []
-    if geom.isMultipart():
-        lines = geom.asMultiPolyline()
-    else:
-        lines = [geom.asPolyline()]
+
+    def _extract(g):
+        if g.isMultipart():
+            lines = g.asMultiPolyline()
+        else:
+            lines = [g.asPolyline()]
+        return [l for l in lines if l is not None and len(l) >= 2]
+
+    lines = _extract(geom)
     if not lines:
-        return []
-    return [l for l in lines if l is not None and len(l) >= 2]
+        flat = _segmentized(geom)
+        if flat is not None:
+            lines = _extract(flat)
+    return lines
 
 
 # ---------------------------------------------------------------------------
