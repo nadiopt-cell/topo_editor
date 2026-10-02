@@ -1,2 +1,18 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Сборка плагина
+dist/
+*.zip
+
+# QGIS / IDE / ОС
+*.py~
+*.bak
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
