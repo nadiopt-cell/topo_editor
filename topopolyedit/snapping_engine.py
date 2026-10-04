@@ -26,7 +26,15 @@
 зависел только от checkedLayers(), и если метод недоступен или вёл себя
 иначе в какой-то версии QGIS, все эталонные слои ТИХО выпадали из
 прилипания (не работал снэп к узлам эталонов и к линиям).
+
+КЭШ: get_snap_layers() вызывается на каждое движение мыши во время
+перетаскивания, поэтому обход дерева кэшируется на короткое время
+(см. CACHE_TTL). Изменения состава/видимости слоёв подхватываются
+с задержкой не больше TTL; чёрный список настроек применяется при
+КАЖДОМ вызове — переключение слоёв в настройках действует мгновенно.
 """
+
+import time
 
 from qgis.core import (
     QgsProject, QgsFeatureRequest, QgsCoordinateTransform,
@@ -36,6 +44,7 @@ from qgis.core import (
 
 from .geo_utils import norm_polys, iter_ring_segments, iter_polyline_parts, point_to_segment
 from . import settings
+from . import utils
 
 # Значения по умолчанию (настройки могут менять их в QgsSettings):
 # имена сохранены для совместимости (использовались в докстрингах/тестах).
@@ -43,27 +52,37 @@ TOLERANCE_PX = settings.DEFAULT_EDGE_TOL          # рёбра, px
 VERTEX_TOLERANCE_PX = settings.DEFAULT_VERTEX_TOL  # узлы (строгий снэп), px
 MAX_FEATURES_PER_LAYER = 20000  # предохранитель от слишком тяжёлых запросов
 
+# TTL кэша списка включённых слоёв, секунды. Достаточно мал, чтобы
+# изменения видимости/состава слоёв подхватывались практически сразу;
+# достаточно велик, чтобы не обходить дерево панели на каждое движение
+# мыши во время перетаскивания.
+CACHE_TTL = 0.75
 
-def get_snap_layers(editable_layer=None):
-    """Список слоёв-участников прилипания.
+_cache_clock = time.monotonic  # подменяется в тестах
+_cache = {"key": None, "layers": None, "ts": 0.0}
 
-    Участвуют все ВКЛЮЧЕННЫЕ (галочка видимости в панели слоёв,
-    включая вложенные группы) векторные слои с геометрией;
-    редактируемый слой добавляется принудительно, даже если выключен.
 
-    Слои, снятые в «Настройках прилипания» (чёрный список настроек),
-    исключаются — включая редактируемый.
+def invalidate_snap_layers_cache():
+    """Сброс кэша списка эталонных слоёв.
 
-    Дерево обходится вручную по itemVisibilityChecked(); checkedLayers()
-    используется как дополнительный источник (страховка от различий
-    версий QGIS — см. докстринг модуля).
+    Явная инвалидация не обязательна (кэш устаревает сам по TTL), но
+    полезна в тестах и на случай, когда нужно гарантированно свежее
+    перечитывание дерева панели слоёв.
+    """
+    _cache["key"] = None
+    _cache["layers"] = None
+    _cache["ts"] = 0.0
 
-    :param editable_layer: редактируемый слой (включается принудительно)
-    :return: [QgsVectorLayer, ...]
+
+def _collect_reference_layers():
+    """Включённые векторные слои БЕЗ чёрного списка и редактируемого.
+
+    Ручной обход дерева по itemVisibilityChecked() (включённая группа
+    раскрывает детей, выключенный узел исключает поддерево) + страховка
+    checkedLayers() (см. докстринг модуля).
     """
     layers = []
     seen = set()
-    disabled = settings.disabled_layer_ids()
 
     def _add(lyr):
         if lyr is None or not lyr.isValid() or lyr.id() in seen:
@@ -72,8 +91,6 @@ def get_snap_layers(editable_layer=None):
             return
         if lyr.geometryType() == QgsWkbTypes.NullGeometry:
             return
-        if lyr.id() in disabled:
-            return  # исключён в настройках прилипания
         layers.append(lyr)
         seen.add(lyr.id())
 
@@ -102,11 +119,48 @@ def get_snap_layers(editable_layer=None):
     except Exception:
         pass
 
-    if editable_layer is not None and editable_layer.isValid() \
-            and editable_layer.id() not in seen \
-            and editable_layer.id() not in disabled:
-        layers.insert(0, editable_layer)
     return layers
+
+
+def _reference_layers():
+    """_collect_reference_layers() с TTL-кэшем (ключ — экземпляр проекта)."""
+    try:
+        key = id(QgsProject.instance())
+    except Exception:
+        key = None
+    now = _cache_clock()
+    if (_cache["layers"] is not None and _cache["key"] == key
+            and (now - _cache["ts"]) < CACHE_TTL):
+        return _cache["layers"]
+    layers = _collect_reference_layers()
+    _cache["key"] = key
+    _cache["layers"] = layers
+    _cache["ts"] = now
+    return layers
+
+
+def get_snap_layers(editable_layer=None):
+    """Список слоёв-участников прилипания.
+
+    Участвуют все ВКЛЮЧЕННЫЕ (галочка видимости в панели слоёв,
+    включая вложенные группы) векторные слои с геометрией;
+    редактируемый слой добавляется принудительно, даже если выключен.
+
+    Слои, снятые в «Настройках прилипания» (чёрный список настроек),
+    исключаются — включая редактируемый. Чёрный список применяется
+    при каждом вызове (изменения настроек действуют сразу); сам обход
+    дерева кэшируется на CACHE_TTL секунд (см. докстринг модуля).
+
+    :param editable_layer: редактируемый слой (включается принудительно)
+    :return: [QgsVectorLayer, ...]
+    """
+    disabled = settings.disabled_layer_ids()
+    result = [l for l in _reference_layers() if l.id() not in disabled]
+    if editable_layer is not None and editable_layer.isValid():
+        eid = editable_layer.id()
+        if eid not in disabled and all(l.id() != eid for l in result):
+            result.insert(0, editable_layer)
+    return result
 
 
 class SnapResult(object):
@@ -196,7 +250,9 @@ class SnappingEngine(object):
             try:
                 res = self._snap_layer(lyr, map_pt, rect_map, dest,
                                        exclude, tol2, tol_v2)
-            except Exception:
+            except Exception as exc:
+                utils.log(u"Слой «{}» пропущен при поиске привязки: {}"
+                          .format(lyr.name(), exc))
                 continue
             if res is None:
                 continue
@@ -231,7 +287,9 @@ class SnappingEngine(object):
                 rect_l = ct_m2l.transformBoundingBox(rect_map)
                 ct = QgsCoordinateTransform(lyr.crs(), dest_crs,
                                             QgsProject.instance())
-            except Exception:
+            except Exception as exc:
+                utils.log(u"Слой «{}»: не удалось преобразовать CRS — "
+                          u"слой пропущен ({})".format(lyr.name(), exc))
                 return None, None
 
         req = QgsFeatureRequest(rect_l)

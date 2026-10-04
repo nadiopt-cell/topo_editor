@@ -10,27 +10,22 @@
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
-from qgis.gui import QgsMapTool, QgsVertexMarker, QgsRubberBand
-from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
-                       Qgis, QgsFeatureRequest)
+from qgis.gui import QgsVertexMarker
+from qgis.core import (QgsPointXY, QgsRectangle, Qgis, QgsFeatureRequest)
 
 from .geo_utils import (norm_polys, polys_to_geom, replace_vertices,
                         find_vertex, contains_vertex)
-from .snapping_engine import SnappingEngine, get_snap_layers
+from .snapping_engine import get_snap_layers
 from .topo_editor import TopoEditor
+from .topo_tool_base import BaseTopoTool
 from . import utils
 
 
-class TopoMoveTool(QgsMapTool):
+class TopoMoveTool(BaseTopoTool):
     """Перетаскивание общего узла всех смежных полигонов редактируемого слоя."""
 
     def __init__(self, iface, action):
-        super(TopoMoveTool, self).__init__(iface.mapCanvas())
-        self.iface = iface
-        self.action = action
-        self.engine = SnappingEngine(iface.mapCanvas())
-        self.drag = None
-        self.rubbers = []
+        super(TopoMoveTool, self).__init__(iface, action)
 
         # маркер узла под курсором (зелёный квадрат)
         self.hover_marker = QgsVertexMarker(self.canvas())
@@ -39,36 +34,12 @@ class TopoMoveTool(QgsMapTool):
         self.hover_marker.setPenWidth(2)
         self.hover_marker.hide()
 
-        # маркер точки прилипания (фиолетовый круг)
-        self.snap_marker = QgsVertexMarker(self.canvas())
-        self.snap_marker.setIconType(QgsVertexMarker.ICON_CIRCLE)
-        self.snap_marker.setColor(QColor(200, 80, 230))
-        self.snap_marker.setPenWidth(2)
-        self.snap_marker.hide()
-
-        # подсветка ребра прилипания
-        self.snap_seg = QgsRubberBand(self.canvas(), QgsWkbTypes.LineGeometry)
-        self.snap_seg.setStrokeColor(QColor(200, 80, 230))
-        self.snap_seg.setWidth(2)
-
     # ------------------------------------------------------------------
     # Служебные
     # ------------------------------------------------------------------
 
-    def _cleanup(self):
-        self.drag = None
-        for rb in self.rubbers:
-            try:
-                rb.reset(QgsWkbTypes.PolygonGeometry)
-            except Exception:
-                pass
-        self.rubbers = []
+    def _cleanup_extra(self):
         self.hover_marker.hide()
-        self.snap_marker.hide()
-        try:
-            self.snap_seg.reset(QgsWkbTypes.LineGeometry)
-        except Exception:
-            pass
 
     def _find_vertex(self, layer, pt_layer, eps):
         """Ближайший узел слоя к точке (CRS слоя) в пределах eps.
@@ -110,25 +81,6 @@ class TopoMoveTool(QgsMapTool):
     # ------------------------------------------------------------------
     # События карты
     # ------------------------------------------------------------------
-
-    def activate(self):
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        super(TopoMoveTool, self).activate()
-
-    def deactivate(self):
-        self._cleanup()
-        if self.action is not None and self.action.isChecked():
-            self.action.setChecked(False)
-        super(TopoMoveTool, self).deactivate()
-
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape:
-            if self.drag is not None:
-                self._cleanup()
-            else:
-                self.iface.actionPan().trigger()
-            return
-        super(TopoMoveTool, self).keyPressEvent(e)
 
     def _no_vertex_message(self, candidates, map_pt):
         """Понятное сообщение: в каких слоях искали и что делать.
@@ -202,17 +154,11 @@ class TopoMoveTool(QgsMapTool):
                 "exclude": {(layer.id(), en["fid"]) for en in entries},
             }
             for _ in entries:
-                rb = QgsRubberBand(self.canvas(), QgsWkbTypes.PolygonGeometry)
-                rb.setStrokeColor(QColor(230, 120, 0))
-                rb.setFillColor(QColor(255, 170, 0, 90))
-                rb.setWidth(2)
-                self.rubbers.append(rb)
+                self._make_polygon_rubber()
             self._update_preview(map_pt, None)
         except Exception as exc:
             self._cleanup()
-            self.iface.messageBar().pushMessage(
-                u"Топологическое редактирование", u"Ошибка: {}".format(exc),
-                level=Qgis.Critical, duration=5)
+            self._push_error(exc)
 
     def canvasMoveEvent(self, e):
         map_pt = e.mapPoint()
@@ -224,8 +170,8 @@ class TopoMoveTool(QgsMapTool):
                                     editable_layer=self.drag["layer"])
             self._show_snap_feedback(snap)
             self._update_preview(map_pt, snap)
-        except Exception:
-            pass
+        except Exception as exc:
+            utils.log(u"Перетаскивание узла: сбой превью — {}".format(exc))
 
     def canvasReleaseEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton or self.drag is None:
@@ -247,9 +193,7 @@ class TopoMoveTool(QgsMapTool):
             report = editor.move_vertex(drag["picked"], new_pt, drag["eps"])
             self._report(report)
         except Exception as exc:
-            self.iface.messageBar().pushMessage(
-                u"Топологическое редактирование", u"Ошибка: {}".format(exc),
-                level=Qgis.Critical, duration=5)
+            self._push_error(exc)
         finally:
             self._cleanup()
 
@@ -294,21 +238,6 @@ class TopoMoveTool(QgsMapTool):
             except Exception:
                 pass
             rb.setToGeometry(g, None)
-
-    def _show_snap_feedback(self, snap):
-        if snap is None:
-            self.snap_marker.hide()
-            self.snap_seg.reset(QgsWkbTypes.LineGeometry)
-            return
-        self.snap_marker.setCenter(snap.point)
-        self.snap_marker.show()
-        if snap.snap_type == "edge" and snap.segment is not None:
-            a, b = snap.segment
-            self.snap_seg.setToGeometry(
-                QgsGeometry.fromPolylineXY([QgsPointXY(a), QgsPointXY(b)]),
-                None)
-        else:
-            self.snap_seg.reset(QgsWkbTypes.LineGeometry)
 
     def _report(self, report):
         bar = self.iface.messageBar()

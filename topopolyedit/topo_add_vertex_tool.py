@@ -10,24 +10,22 @@
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
-from qgis.gui import QgsMapTool, QgsVertexMarker, QgsRubberBand
+from qgis.gui import QgsVertexMarker, QgsRubberBand
 from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
                        Qgis, QgsFeatureRequest)
 
 from .geo_utils import norm_polys, find_segment, point_to_segment
-from .snapping_engine import SnappingEngine, get_snap_layers
+from .snapping_engine import get_snap_layers
 from .topo_editor import TopoEditor
+from .topo_tool_base import BaseTopoTool
 from . import utils
 
 
-class TopoAddVertexTool(QgsMapTool):
+class TopoAddVertexTool(BaseTopoTool):
     """Вставка узла на ребро сразу во все смежные полигоны слоя."""
 
     def __init__(self, iface, action):
-        super(TopoAddVertexTool, self).__init__(iface.mapCanvas())
-        self.iface = iface
-        self.action = action
-        self.engine = SnappingEngine(iface.mapCanvas())
+        super(TopoAddVertexTool, self).__init__(iface, action)
 
         # подсветка ребра, на которое можно вставить узел
         self.edge_rb = QgsRubberBand(self.canvas(), QgsWkbTypes.LineGeometry)
@@ -42,28 +40,12 @@ class TopoAddVertexTool(QgsMapTool):
         self.marker.hide()
 
     # ------------------------------------------------------------------
-    def _cleanup(self):
+    def _cleanup_extra(self):
         try:
             self.edge_rb.reset(QgsWkbTypes.LineGeometry)
         except Exception:
             pass
         self.marker.hide()
-
-    def activate(self):
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        super(TopoAddVertexTool, self).activate()
-
-    def deactivate(self):
-        self._cleanup()
-        if self.action is not None and self.action.isChecked():
-            self.action.setChecked(False)
-        super(TopoAddVertexTool, self).deactivate()
-
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape:
-            self.iface.actionPan().trigger()
-            return
-        super(TopoAddVertexTool, self).keyPressEvent(e)
 
     # ------------------------------------------------------------------
     def _find_segment(self, layer, pt_layer, eps):
@@ -184,9 +166,7 @@ class TopoAddVertexTool(QgsMapTool):
             report = editor.add_vertex_on_edge(a, b, proj, eps)
             self._report(report)
         except Exception as exc:
-            self.iface.messageBar().pushMessage(
-                u"Топологическое редактирование", u"Ошибка: {}".format(exc),
-                level=Qgis.Critical, duration=5)
+            self._push_error(exc)
         finally:
             self._cleanup()
 

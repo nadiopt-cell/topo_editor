@@ -22,6 +22,7 @@ from .geo_utils import (
     polys_bbox, points_bbox, contains_vertex, translate_vertices,
 )
 from .snapping_engine import get_snap_layers
+from . import utils
 
 MAX_CLIP_REFS = 5000  # предохранитель на число эталонных полигонов
 
@@ -103,12 +104,17 @@ class TopoEditor(object):
                             g = QgsGeometry(g)
                             if g.transform(ct) != 0:
                                 continue
-                        except Exception:
+                        except Exception as exc:
+                            utils.log(u"Эталон «{}» #{}: сбой преобразования "
+                                      u"CRS — пропущен ({})"
+                                      .format(lyr.name(), feat.id(), exc))
                             continue
                     refs.append(g)
                     if len(refs) >= MAX_CLIP_REFS:
                         return refs, True
-            except Exception:
+            except Exception as exc:
+                utils.log(u"Слой «{}»: сбой чтения эталонов — {}"
+                          .format(lyr.name(), exc))
                 continue
         return refs, False
 
@@ -128,7 +134,8 @@ class TopoEditor(object):
                 if not gb.intersects(ref.boundingBox()):
                     continue
                 g2 = g.difference(ref)
-            except Exception:
+            except Exception as exc:
+                utils.log(u"Отсечение: сбой difference — {}".format(exc))
                 continue
             if g2 is None or g2.isNull() or g2.isEmpty():
                 g = QgsGeometry()  # полигон полностью поглощён
@@ -143,8 +150,8 @@ class TopoEditor(object):
                             and g3.type() == QgsWkbTypes.PolygonGeometry:
                         g = g3
                         clipped += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    utils.log(u"Отсечение: сбой makeValid — {}".format(exc))
         return g, clipped
 
     def _push(self, text, level=Qgis.Info, duration=4):
@@ -202,8 +209,9 @@ class TopoEditor(object):
                     if not gv.isNull() and not gv.isEmpty() \
                             and gv.type() == QgsWkbTypes.PolygonGeometry:
                         g = gv
-                except Exception:
-                    pass
+                except Exception as exc:
+                    utils.log(u"Запись: сбой makeValid фичи #{} — {}"
+                              .format(e["fid"], exc))
 
             g, clipped_here = self._clip_against_refs(g, refs)
 

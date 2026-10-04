@@ -11,6 +11,29 @@ from . import settings
 
 TOLERANCE_PX = settings.DEFAULT_EDGE_TOL  # прежний допуск, px (совместимость)
 
+LOG_TAG = u"TopoPolyEdit"
+
+
+def log(message, level=None):
+    """Пишет сообщение в панель «Журнал сообщений» (Log Messages Panel),
+    вкладка «TopoPolyEdit».
+
+    Сюда попадают ошибки, которые НЕ показываются в message bar, потому
+    что их обработка предусмотрена кодом (тихие except в критических
+    путях: преобразование CRS, difference, перетаскивание). Без этого
+    такие сбои выглядели бы как «ничего не произошло» и не поддавались
+    диагностике. Уровень по умолчанию — Warning.
+
+    Безопасно вне QGIS: при любой ошибке запись просто пропускается.
+    """
+    try:
+        from qgis.core import QgsMessageLog
+        if level is None:
+            level = Qgis.Warning
+        QgsMessageLog.logMessage(str(message), LOG_TAG, level)
+    except Exception:
+        pass
+
 
 def is_polygon_layer(layer):
     """True — это корректный полигональный векторный слой."""

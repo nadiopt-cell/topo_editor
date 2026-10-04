@@ -63,10 +63,16 @@ class SettingsDialog(QDialog):
         row = QHBoxLayout()
         btn_all = QPushButton(u"Отметить все", grp_layers)
         btn_none = QPushButton(u"Снять все", grp_layers)
+        btn_refresh = QPushButton(u"Обновить", grp_layers)
+        btn_refresh.setToolTip(
+            u"Перечитать список слоёв проекта: свежедобавленные слои "
+            u"появятся в списке, снятые галочки сохранятся.")
         btn_all.clicked.connect(self._check_all)
         btn_none.clicked.connect(self._uncheck_all)
+        btn_refresh.clicked.connect(self._refresh_layers)
         row.addWidget(btn_all)
         row.addWidget(btn_none)
+        row.addWidget(btn_refresh)
         row.addStretch(1)
         v.addLayout(row)
         lay.addWidget(grp_layers)
@@ -102,6 +108,16 @@ class SettingsDialog(QDialog):
                       u"радиуса рёбер — в узел легче попасть.", grp_tol)
         hint.setWordWrap(True)
         grid.addWidget(hint, 3, 0, 1, 2)
+
+        self.lbl_warn = QLabel(
+            u"Внимание: радиус узлов меньше радиуса рёбер — узлы будут "
+            u"захватываться меньшим радиусом, чем рёбра.", grp_tol)
+        self.lbl_warn.setWordWrap(True)
+        self.lbl_warn.setStyleSheet("color: #b8860b;")
+        self.lbl_warn.hide()
+        grid.addWidget(self.lbl_warn, 4, 0, 1, 2)
+        self.spn_edge.valueChanged.connect(self._update_tol_warning)
+        self.spn_vertex.valueChanged.connect(self._update_tol_warning)
         lay.addWidget(grp_tol)
 
         # --------------------------------------------------------------
@@ -124,10 +140,20 @@ class SettingsDialog(QDialog):
         lay.addLayout(row_btn)
 
         self._update_suffixes()
+        self._update_tol_warning()
 
     # ------------------------------------------------------------------
     # Слои
     # ------------------------------------------------------------------
+
+    def _refresh_layers(self):
+        """Перечитывает слои проекта, сохраняя снятые галочки.
+
+        Диалог строит список слоёв один раз при открытии; если проект
+        пополнился, пока диалог открыт, новые слои появятся только после
+        этой кнопки. Уже снятые пользователем галочки сохраняются.
+        """
+        self._fill_layers(set(self._disabled_ids()))
 
     def _fill_layers(self, disabled):
         """Список векторных слоёв проекта с галочками участия."""
@@ -204,6 +230,11 @@ class SettingsDialog(QDialog):
                   else u" px")
         self.spn_edge.setSuffix(suffix)
         self.spn_vertex.setSuffix(suffix)
+
+    def _update_tol_warning(self):
+        """Предупреждение: «строгий» радиус узлов меньше радиуса рёбер."""
+        self.lbl_warn.setVisible(
+            self.spn_vertex.value() < self.spn_edge.value())
 
     # ------------------------------------------------------------------
     # Применение

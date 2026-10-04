@@ -150,6 +150,20 @@ class TopoPolyEditPlugin(object):
 
     # ------------------------------------------------------------------
     def unload(self):
+        # если какой-то из инструментов ещё активен — снять его с канвы,
+        # чтобы QGIS не держал ссылку на удаляемый объект
+        try:
+            canvas = self.iface.mapCanvas()
+        except Exception:
+            canvas = None
+        for tool in (self.tool_move, self.tool_edge, self.tool_add):
+            if tool is None or canvas is None:
+                continue
+            try:
+                if canvas.mapTool() is tool:
+                    canvas.unsetMapTool(tool)
+            except Exception:
+                pass
         for act in (self.act_move, self.act_edge, self.act_add,
                     self.act_settings):
             if act is None:

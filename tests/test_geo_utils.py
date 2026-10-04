@@ -12,6 +12,7 @@
 import math
 import os
 import sys
+import time
 import types
 
 # ---------------------------------------------------------------------------
@@ -238,8 +239,154 @@ core_mod.Qgis = Qgis
 core_mod.QgsLayerTreeNode = QgsLayerTreeNode
 core_mod.QgsSettings = QgsSettings
 
+
+# --- QgsMessageLog: журнал, записи собираются для проверок (секция 20) ---
+class QgsMessageLog(object):
+    MESSAGES = []  # (message, tag, level)
+
+    @staticmethod
+    def logMessage(msg, tag="", level=None):
+        QgsMessageLog.MESSAGES.append((str(msg), tag, level))
+
+
+core_mod.QgsMessageLog = QgsMessageLog
+
+
+# --- стабы qgis.PyQt / qgis.gui (utils, инструменты, BaseTopoTool) ---
+qtcore_mod = types.ModuleType("qgis.PyQt.QtCore")
+
+
+class Qt(object):
+    class CursorShape(object):
+        CrossCursor = 0
+
+    class Key(object):
+        Key_Escape = 0x01000001
+
+    class MouseButton(object):
+        LeftButton = 1
+
+    class CheckState(object):
+        Unchecked = 0
+        Checked = 2
+
+    class ItemDataRole(object):
+        UserRole = 0x0100
+
+    class ItemFlag(object):
+        ItemIsEnabled = 32
+        ItemIsUserCheckable = 16
+
+
+qtcore_mod.Qt = Qt
+
+qtgui_mod = types.ModuleType("qgis.PyQt.QtGui")
+
+
+class QColor(object):
+    def __init__(self, *a):
+        pass
+
+
+qtgui_mod.QColor = QColor
+
+qtwidgets_mod = types.ModuleType("qgis.PyQt.QtWidgets")
+
+
+class QMessageBox(object):
+    Yes = 1
+    No = 0
+
+    @staticmethod
+    def question(*a, **kw):
+        return QMessageBox.No
+
+
+qtwidgets_mod.QMessageBox = QMessageBox
+
+pyqt_mod = types.ModuleType("qgis.PyQt")
+pyqt_mod.__path__ = []
+
+
+class QgsMapTool(object):
+    def __init__(self, canvas):
+        self._canvas = canvas
+
+    def canvas(self):
+        return self._canvas
+
+    def setCursor(self, c):
+        pass
+
+    def activate(self):
+        pass
+
+    def deactivate(self):
+        pass
+
+    def keyPressEvent(self, e):
+        pass
+
+
+class QgsVertexMarker(object):
+    ICON_BOX = 0
+    ICON_CIRCLE = 1
+
+    def __init__(self, canvas):
+        self._center = None
+        self._visible = False
+
+    def setIconType(self, t):
+        pass
+
+    def setColor(self, c):
+        pass
+
+    def setPenWidth(self, w):
+        pass
+
+    def setCenter(self, pt):
+        self._center = pt
+
+    def hide(self):
+        self._visible = False
+
+    def show(self):
+        self._visible = True
+
+
+class QgsRubberBand(object):
+    def __init__(self, canvas, gtype=None):
+        self.geom = None
+
+    def setStrokeColor(self, c):
+        pass
+
+    def setFillColor(self, c):
+        pass
+
+    def setWidth(self, w):
+        pass
+
+    def reset(self, gtype):
+        self.geom = None
+
+    def setToGeometry(self, g, layer):
+        self.geom = g
+
+
+gui_mod = types.ModuleType("qgis.gui")
+gui_mod.QgsMapTool = QgsMapTool
+gui_mod.QgsVertexMarker = QgsVertexMarker
+gui_mod.QgsRubberBand = QgsRubberBand
+
 sys.modules["qgis"] = qgis_mod
 sys.modules["qgis.core"] = core_mod
+sys.modules["qgis.PyQt"] = pyqt_mod
+sys.modules["qgis.PyQt.QtCore"] = qtcore_mod
+sys.modules["qgis.PyQt.QtGui"] = qtgui_mod
+sys.modules["qgis.PyQt.QtWidgets"] = qtwidgets_mod
+sys.modules["qgis.gui"] = gui_mod
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "topopolyedit"))
 import geo_utils as gu  # noqa: E402
@@ -924,6 +1071,241 @@ check("18h reset: True", st.reset_to_defaults() is True)
 check("18h reset: допуски по умолчанию",
       st.tolerance_values() == (10.0, 15.0, st.UNITS_PX))
 check("18h reset: чёрный список очищен", st.disabled_layer_ids() == set())
+
+# ---------------------------------------------------------------------------
+# 19. TTL-кэш списка эталонных слоёв (v1.4.0): обход дерева панели НЕ
+#     выполняется на каждый вызов get_snap_layers; чёрный список
+#     применяется при каждом вызове БЕЗ повторного обхода.
+# ---------------------------------------------------------------------------
+_orig_clock = se._cache_clock
+
+
+class _CountingRoot(_TreeRoot):
+    walks = 0
+
+    def checkedLayers(self):
+        _CountingRoot.walks += 1
+        return super(_CountingRoot, self).checkedLayers()
+
+
+root19 = _CountingRoot(children=[
+    _TreeNode(layer=poly_l),
+    _TreeNode(layer=line_l),
+])
+QgsProject._inst = _FakeProject(root19)
+se.invalidate_snap_layers_cache()
+
+fake_time = [1000.0]
+se._cache_clock = lambda: fake_time[0]
+
+got_a = se.get_snap_layers(None)
+check("19 кэш: первый вызов обходит дерево",
+      _CountingRoot.walks == 1 and
+      [l.id() for l in got_a] == ["L-poly", "L-line"])
+
+se.get_snap_layers(None)
+check("19 кэш: второй вызов взят из кэша (дерево не обходилось)",
+      _CountingRoot.walks == 1)
+
+fake_time[0] += se.CACHE_TTL - 0.01
+se.get_snap_layers(None)
+check("19 кэш: до истечения TTL список всё ещё кэширован",
+      _CountingRoot.walks == 1)
+
+fake_time[0] += 0.1  # за границей TTL
+got_d = se.get_snap_layers(None)
+check("19 кэш: после TTL дерево обходится заново",
+      _CountingRoot.walks == 2 and
+      [l.id() for l in got_d] == ["L-poly", "L-line"])
+
+QgsSettings._store.clear()
+st.save_settings({"disabled": ["L-line"]})
+check("19 кэш: чёрный список фильтрует КАШИРОВАННЫЙ список",
+      [l.id() for l in se.get_snap_layers(None)] == ["L-poly"])
+check("19 кэш: фильтр чёрного списка НЕ приводит к обходу дерева",
+      _CountingRoot.walks == 2)
+QgsSettings._store.clear()
+
+se.invalidate_snap_layers_cache()
+se.get_snap_layers(None)
+check("19 кэш: invalidate() вынуждает свежий обход",
+      _CountingRoot.walks == 3)
+
+got_e = se.get_snap_layers(edit_l)
+check("19 кэш: редактируемый слой вставляется первым и в кэш-режиме",
+      _CountingRoot.walks == 3 and
+      [l.id() for l in got_e] == ["L-edit", "L-poly", "L-line"])
+
+se._cache_clock = _orig_clock
+se.invalidate_snap_layers_cache()
+
+# ---------------------------------------------------------------------------
+# 20. BaseTopoTool (v1.4.0): общее поведение трёх инструментов + логгер.
+# ---------------------------------------------------------------------------
+import topopolyedit.topo_tool_base as tb  # noqa: E402
+
+
+class _FakeEvent(object):
+    def __init__(self, key=None):
+        self._key = key
+
+    def key(self):
+        return self._key
+
+
+class _FakeAction(object):
+    def __init__(self):
+        self.checked = False
+
+    def isChecked(self):
+        return self.checked
+
+    def setChecked(self, v):
+        self.checked = v
+
+
+class _FakeMessageBar(object):
+    def __init__(self):
+        self.messages = []
+
+    def pushMessage(self, title, text, level=None, duration=0):
+        self.messages.append((title, text, level, duration))
+
+
+class _FakePanAction(object):
+    def __init__(self):
+        self.triggers = 0
+
+    def trigger(self):
+        self.triggers += 1
+
+
+class _FakeCanvas(object):
+    def __init__(self):
+        self.tool = None
+
+    def mapTool(self):
+        return self.tool
+
+    def setMapTool(self, t):
+        self.tool = t
+
+    def unsetMapTool(self, t):
+        if self.tool is t:
+            self.tool = None
+
+
+class _FakeIface(object):
+    def __init__(self):
+        self.canvas = _FakeCanvas()
+        self.bar = _FakeMessageBar()
+        self.pan = _FakePanAction()
+
+    def mapCanvas(self):
+        return self.canvas
+
+    def messageBar(self):
+        return self.bar
+
+    def actionPan(self):
+        return self.pan
+
+
+iface20 = _FakeIface()
+act20 = _FakeAction()
+tool = tb.BaseTopoTool(iface20, act20)
+check("20 base: движок прилипания и состояние созданы",
+      tool.engine is not None and tool.drag is None and tool.rubbers == [])
+
+extra_calls = []
+tool._cleanup_extra = lambda: extra_calls.append("extra")
+tool.rubbers.append(QgsRubberBand(None, QgsWkbTypes.PolygonGeometry))
+tool.drag = {"x": 1}
+tool.snap_marker.show()
+tool._cleanup()
+check("20 base: _cleanup сбрасывает drag и ленты, вызывает хук подкласса",
+      tool.drag is None and tool.rubbers == [] and extra_calls == ["extra"])
+
+tool.drag = {"x": 1}
+pan_before = iface20.pan.triggers
+tool.keyPressEvent(_FakeEvent(key=Qt.Key.Key_Escape))
+check("20 base: Esc при перетаскивании — только сброс, actionPan не дёргается",
+      tool.drag is None and iface20.pan.triggers == pan_before)
+
+tool.keyPressEvent(_FakeEvent(key=Qt.Key.Key_Escape))
+check("20 base: Esc без перетаскивания — выход в панорамирование",
+      iface20.pan.triggers == pan_before + 1)
+
+tool.drag = {"x": 1}
+act20.checked = True
+tool.deactivate()
+check("20 base: deactivate — cleanup + снятие галочки кнопки",
+      tool.drag is None and act20.checked is False)
+
+tool._push_error(ValueError("boom"))
+check("20 base: _push_error — единое сообщение Critical в message bar",
+      len(iface20.bar.messages) == 1 and
+      iface20.bar.messages[0][1] == u"Ошибка: boom" and
+      iface20.bar.messages[0][2] == Qgis.Critical)
+
+tool.snap_marker.show()
+tool._show_snap_feedback(None)
+check("20 base: feedback(None) прячет маркер и линию привязки",
+      tool.snap_marker._visible is False and tool.snap_seg.geom is None)
+
+snap_e = se.SnapResult(pt(1, 2), "edge", None, 5, (pt(0, 0), pt(4, 4)))
+tool._show_snap_feedback(snap_e)
+check("20 base: feedback(edge) показывает маркер и ставит линию сегмента",
+      tool.snap_marker._visible is True and tool.snap_seg.geom is not None)
+
+snap_v = se.SnapResult(pt(3, 3), "vertex", None, 7)
+tool._show_snap_feedback(snap_v)
+check("20 base: feedback(vertex) сбрасывает линию ребра",
+      tool.snap_seg.geom is None)
+
+# --- подклассы: собственные маркеры сбрасываются через хук ---
+import topopolyedit.topo_move_tool as tmt  # noqa: E402
+import topopolyedit.topo_edge_move_tool as tet  # noqa: E402
+import topopolyedit.topo_add_vertex_tool as tat  # noqa: E402
+
+mtool = tmt.TopoMoveTool(iface20, _FakeAction())
+mtool.hover_marker.show()
+mtool._cleanup()
+check("20 move: cleanup прячет hover-маркер через _cleanup_extra",
+      mtool.hover_marker._visible is False)
+
+etool = tet.TopoEdgeMoveTool(iface20, _FakeAction())
+etool.snap_marker.show()
+etool._cleanup()
+check("20 edge: cleanup сбрасывает собственные ленты ребра",
+      etool.drag_edge.geom is None and etool.hover_edge.geom is None and
+      etool.rubbers == [] and etool.snap_marker._visible is False)
+
+atool = tat.TopoAddVertexTool(iface20, _FakeAction())
+atool.marker.show()
+atool.edge_rb.setToGeometry(QgsGeometry.fromPolylineXY([pt(0, 0), pt(1, 1)]),
+                            None)
+atool._cleanup()
+check("20 add: cleanup сбрасывает edge_rb и маркер вставки",
+      atool.edge_rb.geom is None and atool.marker._visible is False)
+
+pan_before = iface20.pan.triggers
+atool.keyPressEvent(_FakeEvent(key=Qt.Key.Key_Escape))
+check("20 add: Esc (drag всегда None) — выход в панорамирование",
+      iface20.pan.triggers == pan_before + 1)
+
+# --- логгер ---
+import topopolyedit.utils as ut  # noqa: E402
+
+QgsMessageLog.MESSAGES = []
+ut.log(u"тест-сообщение")
+check("20 лог: log() пишет в QgsMessageLog с тегом TopoPolyEdit и Warning",
+      QgsMessageLog.MESSAGES[-1] == (u"тест-сообщение", u"TopoPolyEdit",
+                                     Qgis.Warning))
+ut.log(u"критично", level=Qgis.Critical)
+check("20 лог: явный уровень передаётся в журнал",
+      QgsMessageLog.MESSAGES[-1][2] == Qgis.Critical)
+QgsMessageLog.MESSAGES = []
 
 # ---------------------------------------------------------------------------
 print("")
