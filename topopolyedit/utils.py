@@ -7,7 +7,9 @@ from qgis.core import (
 )
 from qgis.PyQt.QtWidgets import QMessageBox
 
-TOLERANCE_PX = 10.0  # допуск поиска узлов/рёбер, пикселей
+from . import settings
+
+TOLERANCE_PX = settings.DEFAULT_EDGE_TOL  # прежний допуск, px (совместимость)
 
 
 def is_polygon_layer(layer):
@@ -73,18 +75,32 @@ def resolve_edit_layer(iface, offer_start=True, quiet=False):
     return layers[0] if layers else None
 
 
-def layer_tolerance(canvas, layer, map_pt):
-    """Переводит пиксельный допуск в единицы CRS слоя.
+def _grab_tolerance_map(canvas, kind):
+    """Радиус захвата узла/ребра в единицах карты — из настроек плагина.
+
+    :param kind: "vertex" — радиус строгого снэпа к узлам,
+                 "edge" — радиус прилипания к рёбрам
+    """
+    return settings.tolerance_map_units(canvas, kind)
+
+
+def layer_tolerance(canvas, layer, map_pt, kind="vertex"):
+    """Переводит допуск прилипания в единицы CRS слоя.
+
+    Радиус берётся из настроек плагина: "vertex" — строгий радиус
+    узлов (по умолчанию 15 px) — им ищется узел для перетаскивания;
+    "edge" — радиус рёбер (по умолчанию 10 px) — им ищется ребро.
 
     :param canvas: QgsMapCanvas
     :param layer: редактируемый слой
     :param map_pt: точка в CRS карты
+    :param kind: "vertex" | "edge"
     :return: (pt_layer, eps_layer, ct_map_to_layer, ct_layer_to_map)
     """
     ms = canvas.mapSettings()
     dest = ms.destinationCrs()
     try:
-        tol_map = ms.convertToMapUnits(TOLERANCE_PX, QgsUnitTypes.RenderPixels)
+        tol_map = _grab_tolerance_map(canvas, kind)
     except Exception:
         tol_map = TOLERANCE_PX
     ct_m2l = QgsCoordinateTransform(dest, layer.crs(), QgsProject.instance())

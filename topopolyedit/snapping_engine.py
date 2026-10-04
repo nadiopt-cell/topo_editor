@@ -1,16 +1,25 @@
 # -*- coding: utf-8 -*-
-"""Поисковик привязок (snapping) к узлам и рёбрам всех включенных слоёв.
+"""Поисковик привязок (snapping) к узлам и рёбрам выбранных слоёв.
 
 Участвуют все векторные слои, отмеченные (включенные) в панели слоёв и
 имеющие геометрию, а также редактируемый слой — даже если он выключен.
 Полигональные, ЛИНЕЙНЫЕ и точечные слои. Поиск ограничен текущим
 экстентом карты (запрос по габаритному прямоугольнику).
 
+СЛОИ-ИСКЛЮЧЕНИЯ: слои, снятые галочкой в диалоге «Настройки прилипания»
+(модуль settings, чёрный список по id в QgsSettings), НЕ участвуют в
+прилипании — независимо от видимости. Это относится и к редактируемому
+слою: пользователь явно попросил его не трогать при прилипании.
+
 Приоритет прилипания: узел > ребро (узел побеждает, даже если ребро
 ближе). «Строгий» снэп к узлам: радиус поиска узла БОЛЬШЕ радиуса
-поиска ребра (VERTEX_TOLERANCE_PX > TOLERANCE_PX) — в узел эталонного
-слоя легче попасть. Слои изменяться не могут — движок возвращает только
-точки привязки (модифицируется лишь редактируемый слой).
+поиска ребра — в узел эталонного слоя легче попасть. Оба радиуса и их
+единицы (пиксели / единицы карты) задаются в настройках; значения по
+умолчанию: узлы 15 px, рёбра 10 px. Допуски читаются при КАЖДОМ
+поиске привязки — изменения настроек действуют сразу.
+
+Слои изменяться не могут — движок возвращает только точки привязки
+(модифицируется лишь редактируемый слой).
 
 Список слоёв строится РУЧНЫМ обходом дерева панели слоёв (по галочкам
 видимости) с дополнительным источником checkedLayers(): раньше список
@@ -26,9 +35,12 @@ from qgis.core import (
 )
 
 from .geo_utils import norm_polys, iter_ring_segments, iter_polyline_parts, point_to_segment
+from . import settings
 
-TOLERANCE_PX = 10.0            # радиус прилипания к рёбрам, пикселей
-VERTEX_TOLERANCE_PX = 15.0     # радиус «строгого» прилипания к УЗЛАМ, px
+# Значения по умолчанию (настройки могут менять их в QgsSettings):
+# имена сохранены для совместимости (использовались в докстрингах/тестах).
+TOLERANCE_PX = settings.DEFAULT_EDGE_TOL          # рёбра, px
+VERTEX_TOLERANCE_PX = settings.DEFAULT_VERTEX_TOL  # узлы (строгий снэп), px
 MAX_FEATURES_PER_LAYER = 20000  # предохранитель от слишком тяжёлых запросов
 
 
@@ -39,6 +51,9 @@ def get_snap_layers(editable_layer=None):
     включая вложенные группы) векторные слои с геометрией;
     редактируемый слой добавляется принудительно, даже если выключен.
 
+    Слои, снятые в «Настройках прилипания» (чёрный список настроек),
+    исключаются — включая редактируемый.
+
     Дерево обходится вручную по itemVisibilityChecked(); checkedLayers()
     используется как дополнительный источник (страховка от различий
     версий QGIS — см. докстринг модуля).
@@ -48,6 +63,7 @@ def get_snap_layers(editable_layer=None):
     """
     layers = []
     seen = set()
+    disabled = settings.disabled_layer_ids()
 
     def _add(lyr):
         if lyr is None or not lyr.isValid() or lyr.id() in seen:
@@ -56,6 +72,8 @@ def get_snap_layers(editable_layer=None):
             return
         if lyr.geometryType() == QgsWkbTypes.NullGeometry:
             return
+        if lyr.id() in disabled:
+            return  # исключён в настройках прилипания
         layers.append(lyr)
         seen.add(lyr.id())
 
@@ -85,7 +103,8 @@ def get_snap_layers(editable_layer=None):
         pass
 
     if editable_layer is not None and editable_layer.isValid() \
-            and editable_layer.id() not in seen:
+            and editable_layer.id() not in seen \
+            and editable_layer.id() not in disabled:
         layers.insert(0, editable_layer)
     return layers
 
@@ -104,28 +123,43 @@ class SnapResult(object):
 
 
 class SnappingEngine(object):
-    """Движок прилипания к узлам и рёбрам включенных слоёв в экстенте."""
+    """Движок прилипания к узлам и рёбрам выбранных слоёв в экстенте.
 
-    def __init__(self, canvas, tolerance_px=TOLERANCE_PX):
+    Допуски берутся из настроек плагина (settings.py) при каждом поиске
+    привязки, поэтому изменения в диалоге настроек действуют сразу.
+    Необязательный tolerance_px (ПИКСЕЛИ) перекрывает радиус рёбер из
+    настроек — для особых случаев; обычно не задаётся.
+    """
+
+    def __init__(self, canvas, tolerance_px=None):
         self.canvas = canvas
-        self.tolerance_px = float(tolerance_px)
+        self.tolerance_px = (float(tolerance_px)
+                             if tolerance_px is not None else None)
 
     # ------------------------------------------------------------------
-    def tolerance_map_units(self):
-        """Радиус прилипания к рёбрам в единицах карты."""
+    def _tols_map_units(self):
+        """(радиус рёбер, радиус узлов) в единицах карты — из настроек."""
+        edge_v, vertex_v, units = settings.tolerance_values()
+        if self.tolerance_px is not None:
+            # явный параметр конструктора задаётся в пикселях
+            edge_v = self.tolerance_px
+            units = settings.UNITS_PX
+        if units == settings.UNITS_MAP:
+            return edge_v, vertex_v
         try:
-            return self.canvas.mapSettings().convertToMapUnits(
-                self.tolerance_px, QgsUnitTypes.RenderPixels)
+            ms = self.canvas.mapSettings()
+            return (ms.convertToMapUnits(edge_v, QgsUnitTypes.RenderPixels),
+                    ms.convertToMapUnits(vertex_v, QgsUnitTypes.RenderPixels))
         except Exception:
-            return self.tolerance_px
+            return edge_v, vertex_v
+
+    def tolerance_map_units(self):
+        """Радиус прилипания к рёбрам в единицах карты (из настроек)."""
+        return self._tols_map_units()[0]
 
     def vertex_tolerance_map_units(self):
         """Радиус «строгого» прилипания к узлам в единицах карты."""
-        try:
-            return self.canvas.mapSettings().convertToMapUnits(
-                VERTEX_TOLERANCE_PX, QgsUnitTypes.RenderPixels)
-        except Exception:
-            return VERTEX_TOLERANCE_PX
+        return self._tols_map_units()[1]
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -149,8 +183,7 @@ class SnappingEngine(object):
         :return: SnapResult или None
         """
         dest = self.canvas.mapSettings().destinationCrs()
-        tol = self.tolerance_map_units()
-        tol_v = self.vertex_tolerance_map_units()
+        tol, tol_v = self._tols_map_units()
         tol2 = tol * tol
         tol_v2 = tol_v * tol_v
         reach = max(tol, tol_v)

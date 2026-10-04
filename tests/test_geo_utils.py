@@ -114,7 +114,7 @@ class QgsCoordinateTransform(object):
 
 
 class QgsUnitTypes(object):
-    pass
+    RenderPixels = 0  # как в реальном API — нужен settings.tolerance_map_units
 
 
 class QgsMapLayerType(object):
@@ -132,6 +132,43 @@ class Qgis(object):
     Warning = 1
     Critical = 2
     Success = 3
+
+
+class QgsSettings(object):
+    """Стаб QgsSettings: хранилище в словаре, семантика как у реального.
+
+    Реальный QgsSettings.value(key, default, type=...) при отсутствии
+    ключа возвращает default, при невозможности конвертации — тоже
+    default. Стаб обязан повторять ЭТУ семантику.
+    """
+
+    _store = {}  # общий на тест; очищается в начале секции 18
+
+    def __init__(self):
+        pass
+
+    def value(self, key, default=None, type=None):
+        if key not in QgsSettings._store:
+            return default
+        raw = QgsSettings._store[key]
+        try:
+            if type is float:
+                return float(raw)
+            if type is str:
+                return str(raw)
+            if type is int:
+                return int(raw)
+            if type is bool:
+                return str(raw).lower() in ("true", "1", "yes")
+        except Exception:
+            return default
+        return raw
+
+    def setValue(self, key, value):
+        QgsSettings._store[key] = value
+
+    def remove(self, key):
+        QgsSettings._store.pop(key, None)
 
 
 class QgsGeometry(object):
@@ -199,6 +236,7 @@ core_mod.QgsMapLayerType = QgsMapLayerType
 core_mod.QgsVectorLayer = QgsVectorLayer
 core_mod.Qgis = Qgis
 core_mod.QgsLayerTreeNode = QgsLayerTreeNode
+core_mod.QgsSettings = QgsSettings
 
 sys.modules["qgis"] = qgis_mod
 sys.modules["qgis.core"] = core_mod
@@ -775,6 +813,117 @@ v, e = eng._snap_layer(lyr_m, pt(55, 50), None, SAME, None, TOL2, TOLV2)
 check("snap мультилиния: вершина второй части найдена",
       v is not None and abs(v[1].x() - 50.0) < 1e-9 and
       abs(v[1].y() - 50.0) < 1e-9)
+
+# ---------------------------------------------------------------------------
+# 18. Настройки прилипания (settings.py): чёрный список слоёв + допуски.
+#     QgsSettings стаб словарный; семантика value(key, default, type)
+#     повторяет реальную (нет ключа / не конвертируется -> default).
+# ---------------------------------------------------------------------------
+import topopolyedit.settings as st  # noqa: E402
+
+QgsSettings._store.clear()
+
+# --- 18a: значения по умолчанию ---
+check("18a default: tolerance_values = (10.0, 15.0, px)",
+      st.tolerance_values() == (10.0, 15.0, st.UNITS_PX))
+check("18a default: чёрный список пуст", st.disabled_layer_ids() == set())
+check("18a default: константы движка совпадают с дефолтами настроек",
+      se.TOLERANCE_PX == 10.0 and se.VERTEX_TOLERANCE_PX == 15.0)
+
+# --- 18b: parse_layer_ids ---
+check("18b parse: пробелы и пустые части отброшены",
+      st.parse_layer_ids(u" a , b ,, c ") == ["a", "b", "c"])
+check("18b parse: пустая строка -> []", st.parse_layer_ids(u"") == [])
+check("18b parse: None -> []", st.parse_layer_ids(None) == [])
+
+# --- 18c: сохранение и чтение (round-trip) ---
+check("18c save: True при сохранении",
+      st.save_settings({"edge_tol": 4.5, "vertex_tol": 6.5,
+                        "units": st.UNITS_MAP,
+                        "disabled": ["a", "b"]}) is True)
+check("18c load: значения совпадают",
+      st.load_settings() == {"edge_tol": 4.5, "vertex_tol": 6.5,
+                             "units": st.UNITS_MAP, "disabled": ["a", "b"]})
+check("18c disabled_layer_ids: множество {'a','b'}",
+      st.disabled_layer_ids() == {"a", "b"})
+
+# --- 18d: защита от мусора и границ ---
+QgsSettings._store.clear()
+st.save_settings({"edge_tol": 0.0, "vertex_tol": 1e9,
+                  "units": "bogus", "disabled": ["  ", ""]})
+cfg = st.load_settings()
+check("18d clamp: 0 -> MIN_TOL", cfg["edge_tol"] == st.MIN_TOL)
+check("18d clamp: 1e9 -> MAX_TOL", cfg["vertex_tol"] == st.MAX_TOL)
+check("18d units: мусор -> px", cfg["units"] == st.UNITS_PX)
+check("18d disabled: пустые части отброшены", cfg["disabled"] == [])
+
+# --- 18e: get_snap_layers учитывает чёрный список ---
+QgsSettings._store.clear()
+st.save_settings({"disabled": ["L-line"]})
+check("18e снэп: линия исключена настройками",
+      [l.id() for l in se.get_snap_layers(None)] == ["L-poly"])
+st.save_settings({"disabled": ["L-edit"]})
+check("18e снэп: редактируемый слой тоже можно исключить",
+      [l.id() for l in se.get_snap_layers(edit_l)] == ["L-poly", "L-line"])
+st.save_settings({"disabled": ["L-poly", "L-line", "L-edit"]})
+check("18e снэп: все исключены -> пустой список",
+      se.get_snap_layers(edit_l) == [])
+QgsSettings._store.clear()
+check("18e снэп: без настроек поведение прежнее (редактируемый первым)",
+      [l.id() for l in se.get_snap_layers(edit_l)] ==
+      ["L-edit", "L-poly", "L-line"])
+
+# --- 18f: допуски движка из настроек ---
+QgsSettings._store.clear()
+eng2 = se.SnappingEngine(None)  # canvas=None: px не конвертируются
+check("18f движок: px, canvas None -> значения как есть",
+      (eng2.tolerance_map_units(), eng2.vertex_tolerance_map_units())
+      == (10.0, 15.0))
+st.save_settings({"edge_tol": 3.0, "vertex_tol": 9.0,
+                  "units": st.UNITS_MAP})
+check("18f движок: единицы карты берутся напрямую (canvas не нужен)",
+      (eng2.tolerance_map_units(), eng2.vertex_tolerance_map_units())
+      == (3.0, 9.0))
+
+
+class _FakeMS(object):
+    @staticmethod
+    def convertToMapUnits(value, unit):
+        return value * 0.5
+
+
+class _FakeCanvas(object):
+    @staticmethod
+    def mapSettings():
+        return _FakeMS
+
+
+QgsSettings._store.clear()
+eng3 = se.SnappingEngine(_FakeCanvas)
+check("18f движок: px конвертируются через mapSettings (x0.5)",
+      (eng3.tolerance_map_units(), eng3.vertex_tolerance_map_units())
+      == (5.0, 7.5))
+eng4 = se.SnappingEngine(_FakeCanvas, tolerance_px=20.0)
+check("18f движок: явный tolerance_px перекрывает рёбра (20*0.5=10)",
+      (eng4.tolerance_map_units(), eng4.vertex_tolerance_map_units())
+      == (10.0, 7.5))
+
+# --- 18g: is_snap_disabled ---
+QgsSettings._store.clear()
+st.save_settings({"disabled": ["L-line"]})
+check("18g is_snap_disabled: исключён -> True",
+      st.is_snap_disabled(line_l) is True)
+check("18g is_snap_disabled: не исключён -> False",
+      st.is_snap_disabled(poly_l) is False)
+check("18g is_snap_disabled: None -> False", st.is_snap_disabled(None) is False)
+
+# --- 18h: сброс к значениям по умолчанию ---
+st.save_settings({"edge_tol": 777.0, "vertex_tol": 888.0,
+                  "units": st.UNITS_MAP, "disabled": ["x", "y"]})
+check("18h reset: True", st.reset_to_defaults() is True)
+check("18h reset: допуски по умолчанию",
+      st.tolerance_values() == (10.0, 15.0, st.UNITS_PX))
+check("18h reset: чёрный список очищен", st.disabled_layer_ids() == set())
 
 # ---------------------------------------------------------------------------
 print("")

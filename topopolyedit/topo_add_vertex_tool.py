@@ -97,7 +97,7 @@ class TopoAddVertexTool(QgsMapTool):
         for layer in candidates:
             try:
                 pt_layer, eps, _ct_m2l, ct_l2m = utils.layer_tolerance(
-                    self.canvas(), layer, map_pt)
+                    self.canvas(), layer, map_pt, kind="edge")
                 seg = self._find_segment(layer, pt_layer, eps)
             except Exception:
                 continue
@@ -126,7 +126,7 @@ class TopoAddVertexTool(QgsMapTool):
                 continue
             try:
                 pt_layer, eps, _m2l, _l2m = utils.layer_tolerance(
-                    self.canvas(), lyr, map_pt)
+                    self.canvas(), lyr, map_pt, kind="edge")
                 found = self._find_segment(lyr, pt_layer, eps)
             except Exception:
                 continue
@@ -160,7 +160,7 @@ class TopoAddVertexTool(QgsMapTool):
             eps = ct_m2l = None
             for lyr in candidates:
                 pt_layer, eps, ct_m2l, _ct_l2m = utils.layer_tolerance(
-                    self.canvas(), lyr, map_pt)
+                    self.canvas(), lyr, map_pt, kind="edge")
                 s = self._find_segment(lyr, pt_layer, eps)
                 if s is not None:
                     seg = s

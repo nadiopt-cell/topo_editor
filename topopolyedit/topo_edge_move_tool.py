@@ -245,7 +245,7 @@ class TopoEdgeMoveTool(QgsMapTool):
                 continue
             try:
                 pt_layer, eps, _m2l, _l2m = utils.layer_tolerance(
-                    self.canvas(), lyr, map_pt)
+                    self.canvas(), lyr, map_pt, kind="edge")
                 found = self._find_edge(lyr, pt_layer, eps)
             except Exception:
                 continue
@@ -282,7 +282,7 @@ class TopoEdgeMoveTool(QgsMapTool):
             # найдено ребро
             for lyr in candidates:
                 pt_layer, eps, ct_m2l, ct_l2m = utils.layer_tolerance(
-                    self.canvas(), lyr, map_pt)
+                    self.canvas(), lyr, map_pt, kind="edge")
                 found = self._find_edge(lyr, pt_layer, eps)
                 if found is not None:
                     layer = lyr
@@ -364,7 +364,7 @@ class TopoEdgeMoveTool(QgsMapTool):
         for layer in candidates:
             try:
                 pt_layer, eps, _ct_m2l, ct_l2m = utils.layer_tolerance(
-                    self.canvas(), layer, map_pt)
+                    self.canvas(), layer, map_pt, kind="edge")
                 found = self._find_edge(layer, pt_layer, eps)
             except Exception:
                 continue
