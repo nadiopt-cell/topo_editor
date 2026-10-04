@@ -1308,6 +1308,56 @@ check("20 лог: явный уровень передаётся в журнал
 QgsMessageLog.MESSAGES = []
 
 # ---------------------------------------------------------------------------
+# 21. Регрессия v1.4.1: canvasPressEvent звал _update_preview(*t[1]) —
+#     кортеж (dx, dy) распаковывался в 2 позиционных аргумента вместо
+#     одного -> TypeError «takes 2 positional arguments but 3 were
+#     given», инструмент рёбер умирал при каждом захвате ребра
+#     (баг жил с v1.1.0: сигнатура (self, d_map) принимает ОДИН кортеж).
+# ---------------------------------------------------------------------------
+import inspect  # noqa: E402
+
+src_press = inspect.getsource(tet.TopoEdgeMoveTool.canvasPressEvent)
+check("21 edge: в canvasPressEvent нет распаковки _update_preview(*...)",
+      "_update_preview(*" not in src_press)
+
+args21 = inspect.getfullargspec(tet.TopoEdgeMoveTool._update_preview).args
+check("21 edge: сигнатура _update_preview — (self, d_map), один кортеж",
+      args21 == ["self", "d_map"])
+
+
+class _FakeSnapEngine(object):
+    """Изолирует тест от снэппинга: snap() всегда None."""
+
+    def snap(self, point, exclude=None, editable_layer=None):
+        return None
+
+
+etool.drag = {
+    "layer": None,
+    "anchors": [pt(0, 0), pt(10, 0)],
+    "anchors_map": [pt(0, 0), pt(10, 0)],
+    "press_map": pt(0, 0),
+    "press_layer": pt(0, 0),
+    "eps": 0.5,
+    "ct_m2l": QgsCoordinateTransform(),
+    "ct_l2m": QgsCoordinateTransform(),
+    "entries": [],
+    "exclude": set(),
+}
+etool.engine = _FakeSnapEngine()
+try:
+    # вызов РОВНО как в исправленном canvasPressEvent: [1] от
+    # _translation_delta — это (dx, dy) ОДНИМ кортежем
+    etool._update_preview(etool._translation_delta(pt(5, 3))[1])
+    ok21 = etool.drag_edge.geom is not None
+except TypeError:
+    ok21 = False
+check("21 edge: _update_preview((dx, dy)) одним кортежем заполняет ленту",
+      ok21)
+etool.drag = None
+etool._cleanup()
+
+# ---------------------------------------------------------------------------
 print("")
 if FAILURES:
     print("ИТОГ: ПРОВАЛЕНО тестов: %d -> %s" % (len(FAILURES), FAILURES))

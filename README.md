@@ -87,7 +87,7 @@ tools/make_zip.py      сборка устанавливаемого ZIP в dist
 ## Тесты
 
 ```
-python3 tests/test_geo_utils.py     # 118 проверок ядра, прилипания и
+python3 tests/test_geo_utils.py     # 121 проверка ядра, прилипания и
                                     # инструментов, QGIS не нужен
 ```
 

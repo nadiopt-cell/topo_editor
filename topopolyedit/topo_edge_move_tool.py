@@ -266,7 +266,10 @@ class TopoEdgeMoveTool(BaseTopoTool):
             self._hide_hover()
             for _ in entries:
                 self._make_polygon_rubber()
-            self._update_preview(*self._translation_delta(map_pt)[1])
+            # [1] — это (dx, dy) ОДНИМ кортежем, как в canvasMoveEvent:
+            # распаковка «*» давала 2 позиционных аргумента вместо одного
+            # и падала с TypeError (v1.1.0...v1.4.0)
+            self._update_preview(self._translation_delta(map_pt)[1])
         except Exception as exc:
             self._cleanup()
             self._push_error(exc)
