@@ -96,9 +96,17 @@ class QgsFeatureRequest(object):
 
 
 class QgsProject(object):
+    # _inst подменяется тестами (секция 17) на фейковый проект с деревом слоёв
+    _inst = None
+
     @staticmethod
     def instance():
-        return None
+        return QgsProject._inst
+
+
+class QgsLayerTreeNode(object):
+    NodeLayer = 0
+    NodeGroup = 1
 
 
 class QgsCoordinateTransform(object):
@@ -110,7 +118,9 @@ class QgsUnitTypes(object):
 
 
 class QgsMapLayerType(object):
-    pass
+    VectorLayer = 0
+    RasterLayer = 1
+    PluginLayer = 2
 
 
 class QgsVectorLayer(object):
@@ -188,6 +198,7 @@ core_mod.QgsUnitTypes = QgsUnitTypes
 core_mod.QgsMapLayerType = QgsMapLayerType
 core_mod.QgsVectorLayer = QgsVectorLayer
 core_mod.Qgis = Qgis
+core_mod.QgsLayerTreeNode = QgsLayerTreeNode
 
 sys.modules["qgis"] = qgis_mod
 sys.modules["qgis.core"] = core_mod
@@ -589,6 +600,181 @@ check("collect_edge_moved: C следует за концом (2,4)",
 
 check("collect_edge_moved: пустые якоря -> [] без падения",
       ed._collect_edge_moved([], (1, 0), 1.0) == [])
+
+# ---------------------------------------------------------------------------
+# 17. Прилипание (snapping_engine): строгий снэп к узлам эталонных слоёв
+#     и прилипание к ЛИНЕЙНЫМ слоям. Список слоёв — ручной обход дерева
+#     панели слоёв (v1.1.x зависел только от checkedLayers() — эталонные
+#     слои могли тихо выпадать из прилипания).
+# ---------------------------------------------------------------------------
+import topopolyedit.snapping_engine as se  # noqa: E402
+
+
+class _Crs(object):
+    def __init__(self, authid):
+        self._a = authid
+
+    def authid(self):
+        return self._a
+
+
+class _SnapLyr(object):
+    def __init__(self, lid, gtype, feats):
+        self._lid = lid
+        self._gt = gtype
+        self._feats = feats
+
+    def id(self):
+        return self._lid
+
+    def isValid(self):
+        return True
+
+    def type(self):
+        return QgsMapLayerType.VectorLayer
+
+    def geometryType(self):
+        return self._gt
+
+    def crs(self):
+        return _Crs("EPSG:3857")
+
+    def getFeatures(self, req):
+        return list(self._feats)
+
+
+class _TreeNode(object):
+    def __init__(self, layer=None, children=None, checked=True):
+        self._layer = layer
+        self._children = children if children is not None else []
+        self._checked = checked
+
+    def children(self):
+        return self._children
+
+    def itemVisibilityChecked(self):
+        return self._checked
+
+    def nodeType(self):
+        return (QgsLayerTreeNode.NodeLayer if self._layer is not None
+                else QgsLayerTreeNode.NodeGroup)
+
+    def layer(self):
+        return self._layer
+
+
+class _TreeRoot(_TreeNode):
+    def checkedLayers(self):
+        out = []
+
+        def walk(n):
+            for c in n.children():
+                if not c.itemVisibilityChecked():
+                    continue
+                if c._layer is not None:
+                    out.append(c._layer)
+                else:
+                    walk(c)
+
+        walk(self)
+        return out
+
+
+class _FakeProject(object):
+    def __init__(self, root):
+        self._root = root
+
+    def layerTreeRoot(self):
+        return self._root
+
+
+# --- 17a: get_snap_layers ---
+poly_l = _SnapLyr("L-poly", QgsWkbTypes.PolygonGeometry, [])
+line_l = _SnapLyr("L-line", QgsWkbTypes.LineGeometry, [])
+null_l = _SnapLyr("L-null", QgsWkbTypes.NullGeometry, [])
+off_l = _SnapLyr("L-off", QgsWkbTypes.PolygonGeometry, [])
+root = _TreeRoot(children=[
+    _TreeNode(layer=poly_l),
+    _TreeNode(layer=null_l),
+    _TreeNode(layer=off_l, checked=False),
+    _TreeNode(children=[_TreeNode(layer=line_l)]),  # вложенная группа
+])
+QgsProject._inst = _FakeProject(root)
+
+got = se.get_snap_layers(None)
+check("get_snap_layers: включённые полигон и ЛИНИЯ в списке, выключенный и безгеометричный пропущены",
+      [l.id() for l in got] == ["L-poly", "L-line"])
+
+edit_l = _SnapLyr("L-edit", QgsWkbTypes.PolygonGeometry, [])
+got2 = se.get_snap_layers(edit_l)
+check("get_snap_layers: редактируемый слой добавлен первым",
+      [l.id() for l in got2] == ["L-edit", "L-poly", "L-line"])
+
+# --- 17b: _snap_layer по полигону-эталону ---
+eng = se.SnappingEngine(None)
+TOL2 = 4.0     # рёбра: радиус 2 ед.
+TOLV2 = 100.0  # узлы: радиус 10 ед. (строгий снэп)
+SAME = _Crs("EPSG:3857")
+
+gpoly = QgsGeometry.fromPolygonXY(
+    [ring((10, 10), (20, 10), (20, 20), (10, 20))])
+lyr_p = _SnapLyr("P", QgsWkbTypes.PolygonGeometry, [_Feat(7, gpoly)])
+
+v, e = eng._snap_layer(lyr_p, pt(19, 19), None, SAME, None, TOL2, TOLV2)
+check("snap полигон: узел (20,20) найден у эталонного слоя",
+      v is not None and abs(v[1].x() - 20.0) < 1e-9 and
+      abs(v[1].y() - 20.0) < 1e-9)
+check("snap полигон: ребро тоже найдено", e is not None)
+
+v, e = eng._snap_layer(lyr_p, pt(25, 20), None, SAME, None, TOL2, TOLV2)
+check("snap полигон: СТРОГИЙ узел берётся в увеличенном радиусе (5 ед > 2 ед)",
+      v is not None and abs(v[1].x() - 20.0) < 1e-9)
+check("snap полигон: ребро вне малого допуска -> None", e is None)
+
+v, e = eng._snap_layer(lyr_p, pt(19, 19), None, SAME, {("P", 7)}, TOL2, TOLV2)
+check("snap полигон: исключённая фича игнорируется",
+      v is None and e is None)
+
+# --- 17c: приоритет узел > ребро ---
+r = se.SnappingEngine._pick((9.0, pt(1, 1), "L", 1),
+                            (1.0, pt(2, 2), "L", 2))
+check("приоритет: узел побеждает ребро, даже если ребро ближе",
+      r is not None and r.snap_type == "vertex" and
+      abs(r.point.x() - 1.0) < 1e-9)
+r = se.SnappingEngine._pick(None, (1.0, pt(2, 2), "L", 2, (pt(0, 0), pt(4, 4))))
+check("приоритет: без узла берётся ребро",
+      r is not None and r.snap_type == "edge" and
+      abs(r.point.x() - 2.0) < 1e-9)
+r = se.SnappingEngine._pick(None, None)
+check("приоритет: без кандидатов -> None", r is None)
+
+# --- 17d: прилипание к ЛИНЕЙНОМУ эталонному слою ---
+gline = QgsGeometry.fromPolylineXY([pt(0, 0), pt(10, 0), pt(10, 10)])
+lyr_l = _SnapLyr("L", QgsWkbTypes.LineGeometry, [_Feat(3, gline)])
+
+v, e = eng._snap_layer(lyr_l, pt(10, 4), None, SAME, None, TOL2, TOLV2)
+check("snap линия: узел вершины (10,0) найден",
+      v is not None and abs(v[1].x() - 10.0) < 1e-9 and
+      abs(v[1].y() - 0.0) < 1e-9)
+check("snap линия: прилипание к отрезку линии",
+      e is not None and abs(e[1].x() - 10.0) < 1e-9 and
+      abs(e[1].y() - 4.0) < 1e-9 and
+      abs(e[4][0].x() - 10.0) < 1e-9 and abs(e[4][0].y() - 0.0) < 1e-9 and
+      abs(e[4][1].y() - 10.0) < 1e-9)
+
+v, e = eng._snap_layer(lyr_l, pt(5, 1), None, SAME, None, TOL2, TOLV2)
+check("snap линия: ребро найдено с малого расстояния, узлы далеко",
+      e is not None and abs(e[1].y() - 0.0) < 1e-9)
+
+# мультилиния: вершины обеих частей
+gml = QgsGeometry()
+gml._data = {"type": QgsWkbTypes.LineGeometry, "multi": True,
+             "lines": [[pt(0, 0), pt(5, 0)], [pt(50, 50), pt(60, 50)]]}
+lyr_m = _SnapLyr("M", QgsWkbTypes.LineGeometry, [_Feat(4, gml)])
+v, e = eng._snap_layer(lyr_m, pt(55, 50), None, SAME, None, TOL2, TOLV2)
+check("snap мультилиния: вершина второй части найдена",
+      v is not None and abs(v[1].x() - 50.0) < 1e-9 and
+      abs(v[1].y() - 50.0) < 1e-9)
 
 # ---------------------------------------------------------------------------
 print("")

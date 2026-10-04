@@ -3,46 +3,87 @@
 
 Участвуют все векторные слои, отмеченные (включенные) в панели слоёв и
 имеющие геометрию, а также редактируемый слой — даже если он выключен.
-Поиск ограничен текущим экстентом карты (запрос по габаритному прямоугольнику).
+Полигональные, ЛИНЕЙНЫЕ и точечные слои. Поиск ограничен текущим
+экстентом карты (запрос по габаритному прямоугольнику).
 
-Приоритет прилипания: узел > ребро. Слои изменяться не могут — движок
-возвращает только точки привязки (модифицируется лишь редактируемый слой).
+Приоритет прилипания: узел > ребро (узел побеждает, даже если ребро
+ближе). «Строгий» снэп к узлам: радиус поиска узла БОЛЬШЕ радиуса
+поиска ребра (VERTEX_TOLERANCE_PX > TOLERANCE_PX) — в узел эталонного
+слоя легче попасть. Слои изменяться не могут — движок возвращает только
+точки привязки (модифицируется лишь редактируемый слой).
+
+Список слоёв строится РУЧНЫМ обходом дерева панели слоёв (по галочкам
+видимости) с дополнительным источником checkedLayers(): раньше список
+зависел только от checkedLayers(), и если метод недоступен или вёл себя
+иначе в какой-то версии QGIS, все эталонные слои ТИХО выпадали из
+прилипания (не работал снэп к узлам эталонов и к линиям).
 """
 
 from qgis.core import (
     QgsProject, QgsFeatureRequest, QgsCoordinateTransform,
     QgsPointXY, QgsRectangle, QgsWkbTypes, QgsUnitTypes,
-    QgsMapLayerType, QgsVectorLayer,
+    QgsMapLayerType, QgsVectorLayer, QgsLayerTreeNode,
 )
 
 from .geo_utils import norm_polys, iter_ring_segments, iter_polyline_parts, point_to_segment
 
-TOLERANCE_PX = 10.0            # радиус прилипания, пикселей
+TOLERANCE_PX = 10.0            # радиус прилипания к рёбрам, пикселей
+VERTEX_TOLERANCE_PX = 15.0     # радиус «строгого» прилипания к УЗЛАМ, px
 MAX_FEATURES_PER_LAYER = 20000  # предохранитель от слишком тяжёлых запросов
 
 
 def get_snap_layers(editable_layer=None):
     """Список слоёв-участников прилипания.
 
+    Участвуют все ВКЛЮЧЕННЫЕ (галочка видимости в панели слоёв,
+    включая вложенные группы) векторные слои с геометрией;
+    редактируемый слой добавляется принудительно, даже если выключен.
+
+    Дерево обходится вручную по itemVisibilityChecked(); checkedLayers()
+    используется как дополнительный источник (страховка от различий
+    версий QGIS — см. докстринг модуля).
+
     :param editable_layer: редактируемый слой (включается принудительно)
     :return: [QgsVectorLayer, ...]
     """
     layers = []
     seen = set()
-    root = QgsProject.instance().layerTreeRoot()
-    try:
-        checked = root.checkedLayers()
-    except Exception:
-        checked = []
-    for lyr in checked:
+
+    def _add(lyr):
         if lyr is None or not lyr.isValid() or lyr.id() in seen:
-            continue
+            return
         if lyr.type() != QgsMapLayerType.VectorLayer:
-            continue
+            return
         if lyr.geometryType() == QgsWkbTypes.NullGeometry:
-            continue
+            return
         layers.append(lyr)
         seen.add(lyr.id())
+
+    root = QgsProject.instance().layerTreeRoot()
+
+    # 1) ручной обход дерева: включённая группа раскрывает детей,
+    #    выключенный узел (слой или группа) исключается целиком
+    def _walk(node):
+        for child in node.children():
+            if not child.itemVisibilityChecked():
+                continue
+            if child.nodeType() == QgsLayerTreeNode.NodeLayer:
+                _add(child.layer())
+            else:
+                _walk(child)
+
+    try:
+        _walk(root)
+    except Exception:
+        pass
+
+    # 2) страховка: checkedLayers() как дополнительный источник
+    try:
+        for lyr in root.checkedLayers():
+            _add(lyr)
+    except Exception:
+        pass
+
     if editable_layer is not None and editable_layer.isValid() \
             and editable_layer.id() not in seen:
         layers.insert(0, editable_layer)
@@ -71,12 +112,31 @@ class SnappingEngine(object):
 
     # ------------------------------------------------------------------
     def tolerance_map_units(self):
-        """Радиус прилипания в единицах карты."""
+        """Радиус прилипания к рёбрам в единицах карты."""
         try:
             return self.canvas.mapSettings().convertToMapUnits(
                 self.tolerance_px, QgsUnitTypes.RenderPixels)
         except Exception:
             return self.tolerance_px
+
+    def vertex_tolerance_map_units(self):
+        """Радиус «строгого» прилипания к узлам в единицах карты."""
+        try:
+            return self.canvas.mapSettings().convertToMapUnits(
+                VERTEX_TOLERANCE_PX, QgsUnitTypes.RenderPixels)
+        except Exception:
+            return VERTEX_TOLERANCE_PX
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pick(best_v, best_e):
+        """Выбор итоговой привязки: узел ВСЕГДА важнее ребра."""
+        if best_v is not None:
+            return SnapResult(best_v[1], "vertex", best_v[2], best_v[3])
+        if best_e is not None:
+            return SnapResult(best_e[1], "edge", best_e[2], best_e[3],
+                              best_e[4])
+        return None
 
     # ------------------------------------------------------------------
     def snap(self, map_pt, exclude=None, editable_layer=None):
@@ -90,16 +150,19 @@ class SnappingEngine(object):
         """
         dest = self.canvas.mapSettings().destinationCrs()
         tol = self.tolerance_map_units()
+        tol_v = self.vertex_tolerance_map_units()
         tol2 = tol * tol
-        rect_map = QgsRectangle(map_pt.x() - tol, map_pt.y() - tol,
-                                map_pt.x() + tol, map_pt.y() + tol)
+        tol_v2 = tol_v * tol_v
+        reach = max(tol, tol_v)
+        rect_map = QgsRectangle(map_pt.x() - reach, map_pt.y() - reach,
+                                map_pt.x() + reach, map_pt.y() + reach)
         best_v = None   # (d2, point, layer, fid)
         best_e = None   # (d2, proj, layer, fid, (a, b))
 
         for lyr in get_snap_layers(editable_layer):
             try:
                 res = self._snap_layer(lyr, map_pt, rect_map, dest,
-                                       exclude, tol2)
+                                       exclude, tol2, tol_v2)
             except Exception:
                 continue
             if res is None:
@@ -111,16 +174,19 @@ class SnappingEngine(object):
             if e is not None and (best_e is None or e[0] < best_e[0]):
                 best_e = e
 
-        if best_v is not None:
-            return SnapResult(best_v[1], "vertex", best_v[2], best_v[3])
-        if best_e is not None:
-            return SnapResult(best_e[1], "edge", best_e[2], best_e[3],
-                              best_e[4])
-        return None
+        return self._pick(best_v, best_e)
 
     # ------------------------------------------------------------------
-    def _snap_layer(self, lyr, map_pt, rect_map, dest_crs, exclude, tol2):
-        """Поиск по одному слою. Возвращает (best_vertex, best_edge)."""
+    def _snap_layer(self, lyr, map_pt, rect_map, dest_crs, exclude,
+                    tol2, tol_v2=None):
+        """Поиск по одному слою. Возвращает (best_vertex, best_edge).
+
+        :param tol2: квадрат допуска для рёбер
+        :param tol_v2: квадрат допуска для узлов (строгий снэп —
+                       обычно больше tol2); None => равен tol2
+        """
+        if tol_v2 is None:
+            tol_v2 = tol2
         same = lyr.crs().authid() == dest_crs.authid()
         ct = None
         if same:
@@ -189,7 +255,7 @@ class SnappingEngine(object):
 
             for p in pts:
                 d2 = map_pt.sqrDist(p)
-                if d2 <= tol2 and (best_v is None or d2 < best_v[0]):
+                if d2 <= tol_v2 and (best_v is None or d2 < best_v[0]):
                     best_v = (d2, p, lyr, feat.id())
 
             for a, b in segs:
