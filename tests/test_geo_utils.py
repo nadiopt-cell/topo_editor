@@ -331,6 +331,7 @@ class QgsMapTool(object):
 class QgsVertexMarker(object):
     ICON_BOX = 0
     ICON_CIRCLE = 1
+    ICON_X = 2  # как в реальном API — подсветка узла-цели (v1.4.2)
 
     def __init__(self, canvas):
         self._center = None
@@ -1356,6 +1357,31 @@ check("21 edge: _update_preview((dx, dy)) одним кортежем запол
       ok21)
 etool.drag = None
 etool._cleanup()
+
+# ---------------------------------------------------------------------------
+# 22. Подсветка узла-цели при привязке (v1.4.2): при привязке к вершине
+#     (в т.ч. узлу эталонного слоя) поверх кружка показывается крест.
+# ---------------------------------------------------------------------------
+tool.snap_vertex_marker.show()
+tool._show_snap_feedback(None)
+check("22 фидбек: None прячет и подсветку узла",
+      tool.snap_marker._visible is False and
+      tool.snap_vertex_marker._visible is False)
+
+tool._show_snap_feedback(snap_v)
+check("22 фидбек: vertex — крест узла-цели в точке привязки",
+      tool.snap_vertex_marker._visible is True and
+      tool.snap_vertex_marker._center == snap_v.point)
+
+tool._show_snap_feedback(snap_e)
+check("22 фидбек: edge — подсветка узла скрыта, линия сегмента видна",
+      tool.snap_vertex_marker._visible is False and
+      tool.snap_seg.geom is not None)
+
+tool.snap_vertex_marker.show()
+tool._cleanup()
+check("22 cleanup: подсветка узла сбрасывается",
+      tool.snap_vertex_marker._visible is False)
 
 # ---------------------------------------------------------------------------
 print("")

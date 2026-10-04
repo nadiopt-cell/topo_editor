@@ -7,6 +7,8 @@
   * движок прилипания SnappingEngine;
   * маркер точки прилипания (фиолетовый круг) и подсветка ребра
     прилипания (фиолетовая линия);
+  * подсветка узла-цели (фиолетовый крест) при привязке к вершине —
+    в том числе к узлу эталонного слоя (v1.4.2);
   * оранжевые резиновые ленты перемещаемых полигонов;
   * активация (крест-курсор) и деактивация (сброс состояния + снятие
     галочки кнопки инструмента);
@@ -48,6 +50,14 @@ class BaseTopoTool(QgsMapTool):
         self.snap_marker.setColor(QColor(200, 80, 230))
         self.snap_marker.setPenWidth(2)
         self.snap_marker.hide()
+
+        # подсветка узла-цели (фиолетовый крест) при привязке к вершине:
+        # узел эталонного (или редактируемого) слоя явно виден (v1.4.2)
+        self.snap_vertex_marker = QgsVertexMarker(self.canvas())
+        self.snap_vertex_marker.setIconType(QgsVertexMarker.ICON_X)
+        self.snap_vertex_marker.setColor(QColor(200, 80, 230))
+        self.snap_vertex_marker.setPenWidth(3)
+        self.snap_vertex_marker.hide()
 
         # подсветка ребра прилипания (фиолетовая линия)
         self.snap_seg = QgsRubberBand(self.canvas(), QgsWkbTypes.LineGeometry)
@@ -100,6 +110,7 @@ class BaseTopoTool(QgsMapTool):
         self.drag = None
         self._reset_poly_rubbers()
         self.snap_marker.hide()
+        self.snap_vertex_marker.hide()
         self._reset_snap_seg()
         self._cleanup_extra()
 
@@ -110,13 +121,20 @@ class BaseTopoTool(QgsMapTool):
             level=Qgis.Critical, duration=5)
 
     def _show_snap_feedback(self, snap):
-        """Маркер найденной привязки; для ребра — линия сегмента."""
+        """Маркер найденной привязки; для ребра — линия сегмента, для
+        узла — крест-подсветка вершины-цели."""
         if snap is None:
             self.snap_marker.hide()
+            self.snap_vertex_marker.hide()
             self._reset_snap_seg()
             return
         self.snap_marker.setCenter(snap.point)
         self.snap_marker.show()
+        if snap.snap_type == "vertex":
+            self.snap_vertex_marker.setCenter(snap.point)
+            self.snap_vertex_marker.show()
+        else:
+            self.snap_vertex_marker.hide()
         if snap.snap_type == "edge" and snap.segment is not None:
             a, b = snap.segment
             self.snap_seg.setToGeometry(
