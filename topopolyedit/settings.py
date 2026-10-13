@@ -30,6 +30,7 @@ KEY_UNITS = SNAP_SECTION + "/snap_units"
 KEY_DISABLED = SNAP_SECTION + "/snap_disabled_layers"
 KEY_OVERLAP_MODE = SNAP_SECTION + "/same_layer_overlap"
 KEY_SHOW_HINTS = SNAP_SECTION + "/show_snap_hints"
+KEY_AUDIT_ON = SNAP_SECTION + "/node_audit_on"
 
 # Единицы допуска
 UNITS_PX = "px"      # пиксели экрана
@@ -48,6 +49,7 @@ DEFAULT_EDGE_TOL = 10.0    # рёбра, px
 DEFAULT_VERTEX_TOL = 15.0  # узлы (строгий снэп), px
 DEFAULT_OVERLAP_MODE = OVERLAP_ASK
 DEFAULT_SHOW_HINTS = True  # подсвечивать вершины слоёв прилипания
+DEFAULT_AUDIT_ON = False   # режим «Аудит узлов» по умолчанию выключен
 
 # Границы допуска (в любых единицах)
 MIN_TOL = 0.1
@@ -279,6 +281,36 @@ def show_snap_hints():
                         DEFAULT_SHOW_HINTS)
     except Exception:
         return DEFAULT_SHOW_HINTS
+
+
+def audit_enabled():
+    """True — режим «Аудит узлов» был включён в прошлом сеансе.
+
+    Читает ТОЛЬКО свой ключ: вызывается один раз при загрузке плагина.
+    """
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_AUDIT_ON
+    try:
+        return _as_bool(qs.value(KEY_AUDIT_ON, DEFAULT_AUDIT_ON),
+                        DEFAULT_AUDIT_ON)
+    except Exception:
+        return DEFAULT_AUDIT_ON
+
+
+def set_audit_enabled(on):
+    """Сохраняет состояние «Аудита узлов» (восстановится при старте QGIS).
+
+    :return: True — сохранено; False — QgsSettings недоступен (вне QGIS)
+    """
+    qs = _qsettings()
+    if qs is None:
+        return False
+    try:
+        qs.setValue(KEY_AUDIT_ON, bool(on))
+        return True
+    except Exception:
+        return False
 
 
 def disabled_layer_ids():

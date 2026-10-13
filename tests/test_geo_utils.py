@@ -300,6 +300,23 @@ class Qt(object):
 
 qtcore_mod.Qt = Qt
 
+
+class QTimer(object):
+    """Стаб QTimer: singleShot запоминает выстрелы, тест выполняет сам."""
+
+    _shots = []  # (msec, fn)
+
+    @classmethod
+    def singleShot(cls, msec, fn):
+        cls._shots.append((msec, fn))
+
+    @classmethod
+    def clear(cls):
+        cls._shots = []
+
+
+qtcore_mod.QTimer = QTimer
+
 qtgui_mod = types.ModuleType("qgis.PyQt.QtGui")
 
 
@@ -394,6 +411,7 @@ class QgsVertexMarker(object):
 class QgsRubberBand(object):
     ICON_BOX = 0  # как в реальном API (плоский доступ) — hints-ленты
     ICON_CIRCLE = 1
+    ICON_X = 2  # крест ошибок «Аудита узлов» (v1.6.0)
 
     def __init__(self, canvas, gtype=None):
         self.geom = None
@@ -1653,6 +1671,316 @@ class _EnumOwner(object):
 
 check("23g enum_member: областной доступ (PyQt6-стиль)",
       ut.enum_member(_EnumOwner, "IconType", "ICON_BOX") == 77)
+
+# ---------------------------------------------------------------------------
+# 25. Аудит узлов (node_audit, v1.6.0): classify_border_nodes — узлы
+#     двух групп слоёв; красные крестики = узлы на чужой границе без
+#     пары («лишние»/«недостающие» узлы). Ядро без QGIS.
+# ---------------------------------------------------------------------------
+import topopolyedit.node_audit as na  # noqa: E402
+
+
+def _sq(x0, y0, x1, y1):
+    """Квадрат: вершины и сегменты замкнутого контура (кортежи)."""
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    segs = [(corners[i], corners[(i + 1) % 4]) for i in range(4)]
+    return list(corners), segs
+
+# --- 25a: «недостающие» узлы — вершины B лежат на рёбрах A ---
+pts_a, segs_a = _sq(0, 0, 4, 2)   # A: широкий квадрат 4x2
+pts_b, segs_b = _sq(0, 0, 2, 2)   # B: половинка; узлы x=2 на рёбрах A
+res = na.classify_border_nodes(pts_a, segs_a, pts_b, segs_b)
+check("25a аудит: error_b = вершины B на рёбрах A (недостающие у A)",
+      sorted(res["error_b"]) == [(2.0, 0.0), (2.0, 2.0)])
+check("25a аудит: error_a пусто (узлы A спарены или вне B)",
+      res["error_a"] == [])
+check("25a аудит: углы B у общих узлов — plain",
+      sorted(res["plain_b"]) == [(0.0, 0.0), (0.0, 2.0)])
+check("25a аудит: все узлы A — plain (дальние не трогаем)",
+      len(res["plain_a"]) == 4 and (4.0, 0.0) in res["plain_a"])
+
+# --- 25b: «лишний» узел — вершина A на ребре B ---
+pts_a2, segs_a2 = _sq(0, 0, 4, 2)
+pts_a2.append((1.0, 0.0))                      # разбиение ребра y=0
+segs_a2 = [((0, 0), (1, 0)), ((1, 0), (4, 0)),
+           ((4, 0), (4, 2)), ((4, 2), (0, 2)), ((0, 2), (0, 0))]
+pts_b2, segs_b2 = _sq(0, 0, 4, 2)              # B: ребро целиком
+res2 = na.classify_border_nodes(pts_a2, segs_a2, pts_b2, segs_b2)
+check("25b аудит: error_a = вершина A на ребре B (лишний узел A)",
+      res2["error_a"] == [(1.0, 0.0)] and res2["error_b"] == [])
+
+# --- 25c: вершина далеко от чужой границы — plain ---
+pts_c = [(10.0, 10.0), (10.0, 11.0), (11.0, 11.0), (11.0, 10.0)]
+segs_c = [(pts_c[i], pts_c[(i + 1) % 4]) for i in range(4)]
+res3 = na.classify_border_nodes(pts_c, segs_c, pts_b2, segs_b2)
+check("25c аудит: изолированный полигон — все plain, ошибок нет",
+      res3["error_a"] == [] and len(res3["plain_a"]) == 4 and
+      len(res3["plain_b"]) == 4 and res3["error_b"] == [])
+
+# --- 25d: границы допусков (eps_touch=1e-4, eps_match=1e-6) ---
+line_segs = [((0.0, 0.0), (4.0, 0.0))]
+near_in = (2.0, 9e-5)     # ближе eps_touch -> ошибка
+near_out = (2.0, 2e-4)    # дальше eps_touch -> plain
+res4 = na.classify_border_nodes([near_in, near_out], [],
+                                [], line_segs)
+check("25d аудит: 9e-5 от чужой границы -> error, 2e-4 -> plain",
+      res4["error_a"] == [near_in] and near_out in res4["plain_a"])
+match_in = (2.0 + 5e-7, 0.0)     # в пределах eps_match от узла B
+match_out = (2.0 + 5e-6, 0.0)    # вне eps_match, но на сегменте B
+res5 = na.classify_border_nodes([match_in, match_out], [],
+                                [(2.0, 0.0)], line_segs)
+check("25d аудит: 5e-7 от узла B — совпадение (plain); 5e-6 — error",
+      match_in in res5["plain_a"] and res5["error_a"] == [match_out])
+
+# --- 25e: зазор (sliver) между слоями — НЕ ошибка узлов ---
+pts_g1, segs_g1 = _sq(0, 0, 4, 2)
+pts_g2 = [(x, y + 2.5) for x, y in _sq(0, 0, 4, 2)[0]]  # выше на 2.5
+segs_g2 = [(pts_g2[i], pts_g2[(i + 1) % 4]) for i in range(4)]
+res6 = na.classify_border_nodes(pts_g1, segs_g1, pts_g2, segs_g2)
+check("25e аудит: зазор 2.5 между границами — ошибок узлов нет",
+      res6["error_a"] == [] and res6["error_b"] == [] and
+      len(res6["plain_a"]) == 4 and len(res6["plain_b"]) == 4)
+
+# --- 25f: дедупликация вершин-двойников смежных полигонов ---
+dup_pts = [(0.0, 0.0), (0.0, 0.0), (2.0, 0.0), (2.0 + 5e-9, 0.0),
+           (5.0, 5.0)]
+check("25f дедуп: двойники и 5e-9-близнецы склеены",
+      na.dedup_points(dup_pts) == [(0.0, 0.0), (2.0, 0.0), (5.0, 5.0)])
+res7 = na.classify_border_nodes(dup_pts, [], [], [])
+check("25f дедуп: classify выдаёт уникальные узлы",
+      sorted(res7["plain_a"]) == [(0.0, 0.0), (2.0, 0.0), (5.0, 5.0)])
+
+# --- 25g: вырожденные входы и лимиты ---
+res8 = na.classify_border_nodes([], [], [], [])
+check("25g аудит: пустые входы -> пустые списки без падений",
+      res8 == {"plain_a": [], "error_a": [],
+               "plain_b": [], "error_b": []})
+many = [(float(i), 0.0) for i in range(na.MAX_NODES + 500)]
+res9 = na.classify_border_nodes(many, [], [], [])
+check("25g аудит: лимит MAX_NODES не превышен",
+      len(res9["plain_a"]) == na.MAX_NODES)
+check("25g аудит: мусорные точки отбрасываются",
+      na.dedup_points([(1, 1), "x", None, (2, 2)]) == [(1.0, 1.0),
+                                                       (2.0, 2.0)])
+
+# ---------------------------------------------------------------------------
+# 26. Оверлей «Аудит узлов» (audit_overlay, v1.6.0): включение собирает
+#     узлы обеих групп в видимой области, рисует 3 ленты, показывает
+#     сводку; выключение чистит ленты; дебаунс пан/зума через QTimer.
+# ---------------------------------------------------------------------------
+import topopolyedit.audit_overlay as ao  # noqa: E402
+
+
+class _AuditSignal(object):
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, fn):
+        self.slots.append(fn)
+
+    def disconnect(self, fn):
+        if fn in self.slots:
+            self.slots.remove(fn)
+
+    def emit(self, *a):
+        for fn in list(self.slots):
+            fn(*a)
+
+
+class _AuditFeat(object):
+    def __init__(self, fid, g):
+        self._fid = fid
+        self._g = g
+
+    def id(self):
+        return self._fid
+
+    def geometry(self):
+        return self._g
+
+
+class _AuditLyr(QgsVectorLayer):
+    """Полигональный слой: проходит is_polygon_layer (isinstance)."""
+
+    def __init__(self, lid, feats, editable=False):
+        self._lid = lid
+        self._feats = feats
+        self._editable = editable
+        self.layerModified = _AuditSignal()
+
+    def id(self):
+        return self._lid
+
+    def name(self):
+        return self._lid
+
+    def isValid(self):
+        return True
+
+    def isEditable(self):
+        return self._editable
+
+    def type(self):
+        return QgsMapLayerType.VectorLayer
+
+    def geometryType(self):
+        return QgsWkbTypes.PolygonGeometry
+
+    def crs(self):
+        return _Crs("EPSG:3857")
+
+    def getFeatures(self, req):
+        return list(self._feats)
+
+
+class _AuditProject(object):
+    def __init__(self, root, layers):
+        self._root = root
+        self._layers = layers
+
+    def layerTreeRoot(self):
+        return self._root
+
+    def mapLayers(self):
+        return dict(self._layers)
+
+
+class _AuditMS(object):
+    @staticmethod
+    def destinationCrs():
+        return _Crs("EPSG:3857")
+
+
+class _AuditCanvas(object):
+    def __init__(self):
+        self.extentChanged = _AuditSignal()
+
+    def extent(self):
+        return QgsRectangle(-10, -10, 10, 10)
+
+    def mapSettings(self):
+        return _AuditMS
+
+
+class _AuditIface(object):
+    def __init__(self, edit_layer):
+        self.canvas = _AuditCanvas()
+        self.bar = _FakeMessageBar()
+        self._edit = edit_layer
+
+    def mapCanvas(self):
+        return self.canvas
+
+    def messageBar(self):
+        return self.bar
+
+    def activeLayer(self):
+        return self._edit
+
+
+# сцена: редактируемый A (0..4 x 0..2), эталон B (0..2 x 0..2)
+g_edit = QgsGeometry.fromPolygonXY(
+    [ring((0, 0), (4, 0), (4, 2), (0, 2))])
+g_ref = QgsGeometry.fromPolygonXY(
+    [ring((0, 0), (2, 0), (2, 2), (0, 2))])
+lyr_edit = _AuditLyr("A-edit", [_AuditFeat(1, g_edit)], editable=True)
+lyr_ref = _AuditLyr("B-ref", [_AuditFeat(2, g_ref)])
+audit_root = _TreeRoot(children=[
+    _TreeNode(layer=lyr_edit), _TreeNode(layer=lyr_ref)])
+QgsProject._inst = _AuditProject(audit_root,
+                                 {"A-edit": lyr_edit, "B-ref": lyr_ref})
+se.invalidate_snap_layers_cache()  # TTL-кэш эталонных слоёв секций 17-19
+QgsSettings._store.clear()
+QTimer.clear()
+
+audit = ao.NodeAuditOverlay(_AuditIface(lyr_edit))
+check("26 оверлей: изначально выключен, ленты пусты",
+      audit.enabled is False and audit.band_edit.geom is None)
+
+audit.set_enabled(True)
+check("26 оверлей: включен, extentChanged подключен",
+      audit.enabled is True and len(audit.canvas.extentChanged.slots) == 1)
+check("26 оверлей: узлы редактируемого слоя на оранжевой ленте (4 угла)",
+      audit.band_edit.geom is not None and
+      len(audit.band_edit.geom._data["points"][0]) == 4)
+check("26 оверлей: узлы эталона на синей ленте (4 угла)",
+      audit.band_ref.geom is not None and
+      len(audit.band_ref.geom._data["points"][0]) == 4)
+err_pts = [(round(p.x(), 9), round(p.y(), 9))
+           for p in audit.band_err.geom._data["points"][0]]
+check("26 оверлей: крестики — вершины B на рёбрах A (недостающие)",
+      err_pts == [(2.0, 0.0), (2.0, 2.0)])
+check("26 оверлей: сводка при включении — 4/4 узла, 2 ошибки",
+      len(audit.iface.bar.messages) == 1 and
+      u"Аудит узлов" == audit.iface.bar.messages[0][0] and
+      u"— 2 (красные крестики)" in audit.iface.bar.messages[0][1] and
+      audit.iface.bar.messages[0][2] == Qgis.Warning)
+
+# --- дебаунс пан/зума: сигнал -> QTimer -> пересчёт ---
+QTimer.clear()
+audit.canvas.extentChanged.emit()
+check("26 оверлей: extentChanged ставит отложенный пересчёт",
+      audit._pending is True and len(QTimer._shots) == 1)
+QTimer._shots[0][1]()  # выстрел таймера
+check("26 оверлей: выстрел таймера выполняет пересчёт",
+      audit._pending is False)
+
+# --- правка слоя: layerModified -> schedule_refresh ---
+QTimer.clear()
+lyr_ref.layerModified.emit()
+check("26 оверлей: layerModified слоя ставит отложенный пересчёт",
+      len(QTimer._shots) == 1)
+QTimer._shots[0][1]()
+
+# --- усечение: маленький MAX_NODES -> предупреждение ---
+iface26 = audit.iface
+iface26.bar.messages = []
+saved_max = na.MAX_NODES
+try:
+    na.MAX_NODES = 2
+    audit.refresh()
+finally:
+    na.MAX_NODES = saved_max
+check("26 оверлей: усечение — подсказка «приблизьте масштаб»",
+      len(iface26.bar.messages) == 1 and
+      u"Приблизьте" in iface26.bar.messages[0][1] and
+      iface26.bar.messages[0][2] == Qgis.Warning)
+
+# --- выключение: ленты чистятся, сигналы отключаются ---
+audit.set_enabled(False)
+check("26 оверлей: выключение чистит ленты и отключает сигналы",
+      audit.enabled is False and audit.band_edit.geom is None and
+      audit.band_ref.geom is None and audit.band_err.geom is None and
+      audit.canvas.extentChanged.slots == [] and
+      audit._last is None)
+
+# --- без слоёв: не падает, сообщение не ошибка ---
+QgsProject._inst = _AuditProject(_TreeRoot(children=[]), {})
+se.invalidate_snap_layers_cache()
+empty_iface = _AuditIface(None)
+empty_audit = ao.NodeAuditOverlay(empty_iface)
+empty_audit.set_enabled(True)
+check("26 оверлей: без слоёв — включается, ленты пусты, сводка 0/0/0",
+      empty_audit.enabled is True and empty_audit.band_edit.geom is None and
+      u"— 0 (красные крестики)" in empty_audit.iface.bar.messages[-1][1])
+empty_audit.set_enabled(False)
+
+# ---------------------------------------------------------------------------
+# 27. Настройки «Аудита узлов» (v1.6.0): audit_enabled/set_audit_enabled —
+#     состояние кнопки запоминается между сеансами QGIS.
+# ---------------------------------------------------------------------------
+QgsSettings._store.clear()
+check("27 аудит-настройки: по умолчанию выключен",
+      st.audit_enabled() is False)
+check("27 аудит-настройки: сохранение возвращает True",
+      st.set_audit_enabled(True) is True)
+check("27 аудит-настройки: состояние читается обратно",
+      st.audit_enabled() is True)
+st.set_audit_enabled(False)
+check("27 аудит-настройки: выключение сохраняется",
+      st.audit_enabled() is False)
+check("27 аудит-настройки: ключ изолирован от load_settings",
+      "audit" not in str(st.load_settings()))
 
 # ---------------------------------------------------------------------------
 print("")

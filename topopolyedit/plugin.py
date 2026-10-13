@@ -7,6 +7,9 @@
   * «Перемещение ребра» — перетаскивание целого ребра: оба конца
     и все смежные полигоны двигаются сразу;
   * «Добавить узел на ребре» — топологическая вставка узла на ребро;
+  * «Аудит узлов» — вершины редактируемого слоя и слоёв прилипания
+    одновременно, контрастными цветами; красные крестики — узлы общей
+    границы без пары на другой стороне (топологические ошибки);
   * «Настройки прилипания…» — выбор слоёв-эталонов и допусков.
 """
 
@@ -19,7 +22,9 @@ from qgis.core import Qgis
 from .topo_move_tool import TopoMoveTool
 from .topo_edge_move_tool import TopoEdgeMoveTool
 from .topo_add_vertex_tool import TopoAddVertexTool
+from .audit_overlay import NodeAuditOverlay
 from .settings_dialog import SettingsDialog
+from . import settings
 
 MENU_TITLE = u"Топологическое редактирование"
 
@@ -54,6 +59,16 @@ TOOLTIP_SETTINGS = (
     u"и режим обработки перехлёста с объектами своего слоя.\n"
     u"Настройки действуют сразу на все три инструмента.")
 
+TOOLTIP_AUDIT = (
+    u"Аудит узлов: вершины двух групп слоёв сразу\n\n"
+    u"Оранжевые квадраты — узлы редактируемого слоя (или активного\n"
+    u"полигонального), синие кружки — узлы слоёв прилипания.\n"
+    u"Красные крестики — узлы на чужой границе, у которых нет пары на\n"
+    u"другой стороне стыка: лишние или недостающие узлы — топологические\n"
+    u"ошибки на границах слоёв. Режим работает поверх любого инструмента;\n"
+    u"картина обновляется при пан/зуме и правках слоя. Состояние\n"
+    u"запоминается между сеансами QGIS.")
+
 
 class TopoPolyEditPlugin(object):
     """Класс плагина, инициализируемый через classFactory."""
@@ -64,10 +79,12 @@ class TopoPolyEditPlugin(object):
         self.act_move = None
         self.act_edge = None
         self.act_add = None
+        self.act_audit = None
         self.act_settings = None
         self.tool_move = None
         self.tool_edge = None
         self.tool_add = None
+        self.audit = None
 
     # ------------------------------------------------------------------
     def initGui(self):
@@ -75,6 +92,7 @@ class TopoPolyEditPlugin(object):
         icon_move = QIcon(os.path.join(base, "icons", "topo_move.svg"))
         icon_edge = QIcon(os.path.join(base, "icons", "topo_edge.svg"))
         icon_add = QIcon(os.path.join(base, "icons", "topo_add_vertex.svg"))
+        icon_audit = QIcon(os.path.join(base, "icons", "topo_audit.svg"))
         icon_settings = QIcon(os.path.join(base, "icons",
                                            "topo_settings.svg"))
 
@@ -99,19 +117,34 @@ class TopoPolyEditPlugin(object):
         self.act_add.setToolTip(TOOLTIP_ADD)
         self.act_add.triggered.connect(self._on_add_triggered)
 
+        self.act_audit = QAction(icon_audit, u"Аудит узлов",
+                                 self.iface.mainWindow())
+        self.act_audit.setCheckable(True)
+        self.act_audit.setToolTip(TOOLTIP_AUDIT)
+        self.act_audit.triggered.connect(self._on_audit_triggered)
+
         self.act_settings = QAction(icon_settings, u"Настройки прилипания…",
                                     self.iface.mainWindow())
         self.act_settings.setToolTip(TOOLTIP_SETTINGS)
         self.act_settings.triggered.connect(self._on_settings_triggered)
 
         for act in (self.act_move, self.act_edge, self.act_add,
-                    self.act_settings):
+                    self.act_audit, self.act_settings):
             self.toolbar.addAction(act)
             self.iface.addPluginToVectorMenu(MENU_TITLE, act)
 
         self.tool_move = TopoMoveTool(self.iface, self.act_move)
         self.tool_edge = TopoEdgeMoveTool(self.iface, self.act_edge)
         self.tool_add = TopoAddVertexTool(self.iface, self.act_add)
+        self.audit = NodeAuditOverlay(self.iface)
+
+        # восстановление состояния «Аудита узлов» прошлого сеанса
+        if settings.audit_enabled():
+            self.act_audit.setChecked(True)
+            try:
+                self.audit.set_enabled(True)
+            except Exception:
+                self.act_audit.setChecked(False)
 
     # ------------------------------------------------------------------
     def _on_move_triggered(self, checked):
@@ -141,6 +174,21 @@ class TopoPolyEditPlugin(object):
             if self.iface.mapCanvas().mapTool() is self.tool_add:
                 self.iface.actionPan().trigger()
 
+    def _on_audit_triggered(self, checked):
+        try:
+            self.audit.set_enabled(checked)
+        except Exception as exc:
+            self.iface.messageBar().pushMessage(
+                MENU_TITLE,
+                u"Не удалось переключить аудит узлов: {}".format(exc),
+                level=Qgis.Critical, duration=5)
+            self.act_audit.setChecked(False)
+            try:
+                self.audit.set_enabled(False)
+            except Exception:
+                pass
+        settings.set_audit_enabled(bool(checked))
+
     def _on_settings_triggered(self):
         try:
             dlg = SettingsDialog(self.iface, self.iface.mainWindow())
@@ -153,6 +201,12 @@ class TopoPolyEditPlugin(object):
 
     # ------------------------------------------------------------------
     def unload(self):
+        # оверлей аудита: отключить сигналы и сбросить ленты
+        if self.audit is not None:
+            try:
+                self.audit.shutdown()
+            except Exception:
+                pass
         # если какой-то из инструментов ещё активен — снять его с канвы,
         # чтобы QGIS не держал ссылку на удаляемый объект
         try:
@@ -168,7 +222,7 @@ class TopoPolyEditPlugin(object):
             except Exception:
                 pass
         for act in (self.act_move, self.act_edge, self.act_add,
-                    self.act_settings):
+                    self.act_audit, self.act_settings):
             if act is None:
                 continue
             try:
@@ -181,11 +235,13 @@ class TopoPolyEditPlugin(object):
                 pass
         if self.toolbar is not None:
             self.toolbar.deleteLater()
+        self.audit = None
         self.tool_move = None
         self.tool_edge = None
         self.tool_add = None
         self.act_move = None
         self.act_edge = None
         self.act_add = None
+        self.act_audit = None
         self.act_settings = None
         self.toolbar = None
