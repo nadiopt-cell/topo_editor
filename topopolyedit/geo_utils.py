@@ -18,6 +18,21 @@ from qgis.core import QgsPointXY, QgsGeometry, QgsRectangle, QgsWkbTypes
 # но выше шума вычислений с плавающей запятой.
 DUP_EPS2 = 1e-12
 
+# Топологическое совпадение вершин (единицы CRS слоя).
+# НЕ путать с допуском прилипания (snap, 10–15 px): snap — только «что
+# под курсором», topo-match — «какие вершины считаются одним узлом»
+# при перемещении / сборе смежных фич / insert. Слишком широкий match
+# (раньше = snap) склеивал соседние узлы в плотной сети.
+TOPO_MATCH_EPS = 1e-6
+TOPO_MATCH_EPS2 = TOPO_MATCH_EPS * TOPO_MATCH_EPS  # == DUP_EPS2
+
+# Коллинеарность для collinear_run (цепочка вершин на ребре).
+# Шире topo-match (ловит вершины, вставленные на ребро с float-шумом),
+# но на порядки уже snap-допуска — иначе при мелком масштабе в цепочку
+# попадает почти вся граница.
+COLLINEAR_EPS = 1e-4
+COLLINEAR_EPS2 = COLLINEAR_EPS * COLLINEAR_EPS
+
 
 # ---------------------------------------------------------------------------
 # Нормализация / сборка геометрии
@@ -221,6 +236,33 @@ def contains_vertex(polys, pt, eps2):
             if v.sqrDist(pt) <= eps2:
                 return True
     return False
+
+
+def collect_matching_points(polys, pt, eps2):
+    """Уникальные вершины polys, совпадающие с pt в пределах eps2.
+
+    Замыкающий дубликат кольца не дублируется в результате.
+    :return: [QgsPointXY, ...]
+    """
+    out = []
+    seen = []
+    for _pi, _ri, ring in iter_rings(polys):
+        n = len(ring)
+        for vi in range(n):
+            if vi == n - 1 and n > 1 and ring[0].sqrDist(ring[-1]) <= DUP_EPS2:
+                continue
+            v = ring[vi]
+            if v.sqrDist(pt) > eps2:
+                continue
+            dup = False
+            for s in seen:
+                if v.sqrDist(s) <= DUP_EPS2:
+                    dup = True
+                    break
+            if not dup:
+                seen.append(QgsPointXY(v))
+                out.append(QgsPointXY(v))
+    return out
 
 
 # ---------------------------------------------------------------------------

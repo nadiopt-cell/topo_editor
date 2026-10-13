@@ -10,8 +10,11 @@
     где они есть: полигоны с общим ребром двигаются вместе, полигоны,
     примыкающие только концом, следуют за этим концом;
   * прилипание нового положения концов цепочки к узлам и рёбрам всех
-    включенных слоёв (перемещаемые фичи исключены);
-  * перехлесты отсекаются автоматически (TopoEditor.move_edge);
+    включенных слоёв (перемещаемые фичи исключены); вершины слоёв
+    прилипания подсвечиваются;
+  * перехлёсты с полигонами других слоёв отсекаются автоматически, а с
+    объектами ЭТОГО ЖЕ слоя — по запросу пользователя (красная область в
+    превью, диалог при отпускании; TopoEditor.move_edge);
   * Esc — отмена перетаскивания / выход из инструмента.
 """
 
@@ -23,7 +26,8 @@ from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
 
 from .geo_utils import (norm_polys, polys_to_geom, collinear_run,
                         translate_vertices, find_segment, contains_vertex,
-                        points_bbox)
+                        points_bbox, TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
+                        COLLINEAR_EPS2)
 from .snapping_engine import get_snap_layers
 from .topo_editor import TopoEditor
 from .topo_tool_base import BaseTopoTool
@@ -77,19 +81,17 @@ class TopoEdgeMoveTool(BaseTopoTool):
         except Exception:
             pass
 
-    def _find_edge(self, layer, pt_layer, eps):
+    def _find_edge(self, layer, pt_layer, snap_eps):
         """Ближайшее невырожденное ребро слоя к точке (CRS слоя).
 
-        Ребро разворачивается в полную прямолинейную цепочку вершин
-        (промежуточные вершины на прямой включаются).
-
-        Ошибки чтения данных НЕ проглатываются — они поднимаются выше,
-        чтобы инструмент показал настоящую причину, а не «нет ребра».
+        Поиск сегмента — по snap_eps (допуск захвата). Цепочка
+        коллинеарных вершин — по COLLINEAR_EPS2 (не snap!). Вырожденность
+        концов — по TOPO_MATCH_EPS2.
 
         :return: (anchors, nr) или None; anchors — [QgsPointXY, ...]
         """
-        rect = QgsRectangle(pt_layer.x() - eps, pt_layer.y() - eps,
-                            pt_layer.x() + eps, pt_layer.y() + eps)
+        rect = QgsRectangle(pt_layer.x() - snap_eps, pt_layer.y() - snap_eps,
+                            pt_layer.x() + snap_eps, pt_layer.y() + snap_eps)
         best = None
         best_nr = None
         req = QgsFeatureRequest(rect)
@@ -98,11 +100,11 @@ class TopoEdgeMoveTool(BaseTopoTool):
             nr = norm_polys(feat.geometry())
             if not nr:
                 continue
-            r = find_segment(nr[0], pt_layer, eps * eps)
+            r = find_segment(nr[0], pt_layer, snap_eps * snap_eps)
             if r is None:
                 continue
             _pi, _ri, _si, a, b, _proj, d2 = r
-            if a.sqrDist(b) <= eps * eps:
+            if a.sqrDist(b) <= TOPO_MATCH_EPS2:
                 continue  # вырожденный сегмент — работа инструмента узлов
             if best is None or d2 < best[6]:
                 best = r
@@ -110,19 +112,23 @@ class TopoEdgeMoveTool(BaseTopoTool):
         if best is None:
             return None
         pi, ri, si, _a, _b, _proj, _d2 = best
-        anchors = collinear_run(best_nr[0][pi][ri], si, eps * eps)
+        # collinear — геометрический допуск, НЕ snap
+        anchors = collinear_run(best_nr[0][pi][ri], si, COLLINEAR_EPS2)
         if len(anchors) < 2 or \
-                anchors[0].sqrDist(anchors[-1]) <= eps * eps:
+                anchors[0].sqrDist(anchors[-1]) <= TOPO_MATCH_EPS2:
             return None
         return anchors, best_nr
 
-    def _collect_edge_set(self, layer, anchors, eps):
-        """Все фичи слоя, содержащие хотя бы одну якорную вершину."""
+    def _collect_edge_set(self, layer, anchors, match_eps=TOPO_MATCH_EPS):
+        """Все фичи слоя, содержащие хотя бы одну якорную вершину.
+
+        match_eps — топологическое совпадение (TOPO_MATCH_EPS), не snap.
+        """
         rect = points_bbox(anchors)
         if rect is None:
             return []  # пустые якоря — искать нечего
-        rect.grow(eps)
-        eps2 = eps * eps
+        rect.grow(match_eps)
+        match2 = match_eps * match_eps
         entries = []
         req = QgsFeatureRequest(rect)
         req.setSubsetOfAttributes([])
@@ -133,7 +139,7 @@ class TopoEdgeMoveTool(BaseTopoTool):
             polys, was_multi = nr
             hit = False
             for a in anchors:
-                if contains_vertex(polys, a, eps2):
+                if contains_vertex(polys, a, match2):
                     hit = True
                     break
             if hit:
@@ -155,10 +161,13 @@ class TopoEdgeMoveTool(BaseTopoTool):
         dx = map_pt.x() - drag["press_map"].x()
         dy = map_pt.y() - drag["press_map"].y()
         best = None  # (dist2, snap, (vx, vy))
-        for src in (drag["anchors_map"][0], drag["anchors_map"][-1]):
+        ends = (drag["anchors_map"][0], drag["anchors_map"][-1])
+        for i, src in enumerate(ends):
             cand = QgsPointXY(src.x() + dx, src.y() + dy)
+            # подсказки второго конца дополняют подсказки первого
             snap = self.engine.snap(cand, exclude=drag["exclude"],
-                                    editable_layer=drag["layer"])
+                                    editable_layer=drag["layer"],
+                                    accumulate_hints=(i > 0))
             if snap is None:
                 continue
             vx = snap.point.x() - cand.x()
@@ -247,7 +256,7 @@ class TopoEdgeMoveTool(BaseTopoTool):
                 self._no_edge_message(candidates, map_pt)
                 return
             anchors, _nr = found
-            entries = self._collect_edge_set(layer, anchors, eps)
+            entries = self._collect_edge_set(layer, anchors, TOPO_MATCH_EPS)
             if not entries:
                 return
             self.drag = {
@@ -257,7 +266,8 @@ class TopoEdgeMoveTool(BaseTopoTool):
                                 for p in anchors],
                 "press_map": QgsPointXY(map_pt),
                 "press_layer": QgsPointXY(pt_layer),
-                "eps": eps,
+                "match_eps": TOPO_MATCH_EPS,
+                "snap_eps": eps,
                 "ct_m2l": ct_m2l,
                 "ct_l2m": ct_l2m,
                 "entries": entries,
@@ -296,8 +306,9 @@ class TopoEdgeMoveTool(BaseTopoTool):
             if delta_l[0] * delta_l[0] + delta_l[1] * delta_l[1] <= 1e-12:
                 self._cleanup()
                 return
-            editor = TopoEditor(self.iface, drag["layer"])
-            report = editor.move_edge(drag["anchors"], delta_l, drag["eps"])
+            editor = TopoEditor(self.iface, drag["layer"], self._ask_overlap)
+            report = editor.move_edge(drag["anchors"], delta_l,
+                                      drag["match_eps"])
             self._report(report)
         except Exception as exc:
             self._push_error(exc)
@@ -340,16 +351,19 @@ class TopoEdgeMoveTool(BaseTopoTool):
         if drag is None:
             return
         delta_l = self._layer_delta(d_map)
-        eps2 = drag["eps"] * drag["eps"]
+        match2 = drag["match_eps"] * drag["match_eps"]
+        prepared = []  # [(fid, геометрия в CRS слоя)] — для красной области
         for rb, en in zip(self.rubbers, drag["entries"]):
             new_polys, _ch = translate_vertices(en["polys"], drag["anchors"],
-                                                delta_l, eps2)
+                                                delta_l, match2)
             g = polys_to_geom(new_polys, en["multi"])
+            prepared.append((en["fid"], QgsGeometry(g)))
             try:
                 g.transform(drag["ct_l2m"])
             except Exception:
                 pass
             rb.setToGeometry(g, None)
+        self._update_overlap_preview(drag["layer"], drag["ct_l2m"], prepared)
         try:
             line = [QgsPointXY(p.x() + d_map[0], p.y() + d_map[1])
                     for p in drag["anchors_map"]]
@@ -365,11 +379,16 @@ class TopoEdgeMoveTool(BaseTopoTool):
                             u"Отмена: {}".format(report["error"]),
                             level=Qgis.Warning, duration=5)
             return
+        if report.get("cancelled"):
+            self._push_cancelled()
+            return
         if report.get("moved"):
             msg = u"Ребро перемещено; полигонов обновлено: {}".format(
                 report["moved"])
             if report.get("clipped"):
                 msg += u"; перехлестов отсечено: {}".format(report["clipped"])
+            for note in self._overlap_notes(report):
+                msg += u"; " + note
             if report.get("skipped"):
                 msg += u"; пропущено: {}".format(report["skipped"])
             bar.pushMessage(u"Топологическое редактирование", msg,

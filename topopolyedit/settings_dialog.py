@@ -18,7 +18,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
     QListWidget, QListWidgetItem, QPushButton, QComboBox, QDoubleSpinBox,
-    QDialogButtonBox,
+    QDialogButtonBox, QCheckBox,
 )
 from qgis.core import QgsProject, QgsWkbTypes, QgsVectorLayer
 
@@ -27,6 +27,13 @@ from . import settings
 _UNITS_LABELS = [
     (u"пикселей экрана", settings.UNITS_PX),
     (u"единиц карты", settings.UNITS_MAP),
+]
+
+_OVERLAP_LABELS = [
+    (u"Спрашивать при отпускании кнопки мыши", settings.OVERLAP_ASK),
+    (u"Всегда обрезать перемещаемые полигоны по соседям",
+     settings.OVERLAP_CLIP),
+    (u"Не обрезать (оставлять перехлёст)", settings.OVERLAP_KEEP),
 ]
 
 
@@ -121,13 +128,49 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp_tol)
 
         # --------------------------------------------------------------
+        # Подсветка и перехлёсты
+        # --------------------------------------------------------------
+        grp_vis = QGroupBox(u"Подсветка и перехлёсты", self)
+        vis = QVBoxLayout(grp_vis)
+        self.chk_hints = QCheckBox(
+            u"Подсвечивать вершины слоёв прилипания при перетаскивании",
+            grp_vis)
+        self.chk_hints.setToolTip(
+            u"Бирюзовые квадраты — вершины слоёв-эталонов рядом с курсором;\n"
+            u"фиолетовые кружки — все вершины объекта, к которому\n"
+            u"происходит прилипание.")
+        self.chk_hints.setChecked(bool(cfg.get("show_hints", True)))
+        vis.addWidget(self.chk_hints)
+
+        row_ov = QHBoxLayout()
+        row_ov.addWidget(QLabel(
+            u"Перехлёст с объектами редактируемого слоя:", grp_vis))
+        self.cmb_overlap = QComboBox(grp_vis)
+        for label, data in _OVERLAP_LABELS:
+            self.cmb_overlap.addItem(label, data)
+        self._select_overlap(cfg.get("overlap_mode"))
+        row_ov.addWidget(self.cmb_overlap, 1)
+        vis.addLayout(row_ov)
+        ov_hint = QLabel(
+            u"Если перемещаемый полигон наезжает на другой объект этого же "
+            u"слоя, он показывается красной областью, а при отпускании "
+            u"кнопки можно выбрать: обрезать перемещаемые полигоны, "
+            u"обрезать соседей, оставить как есть или отменить правку. "
+            u"Перекрытия с полигонами других слоёв отсекаются автоматически "
+            u"(как раньше).", grp_vis)
+        ov_hint.setWordWrap(True)
+        vis.addWidget(ov_hint)
+        lay.addWidget(grp_vis)
+
+        # --------------------------------------------------------------
         # Кнопки
         # --------------------------------------------------------------
         row_btn = QHBoxLayout()
         self.btn_reset = QPushButton(u"По умолчанию", self)
         self.btn_reset.setToolTip(
             u"Вернуть значения по умолчанию (10 px рёбра, 15 px узлы,\n"
-            u"прилипать ко всем слоям). Затем нажмите OK.")
+            u"прилипать ко всем слоям, подсветка вершин включена,\n"
+            u"перехлёст — спрашивать). Затем нажмите OK.")
         self.btn_reset.clicked.connect(self._reset_defaults)
         row_btn.addWidget(self.btn_reset)
         row_btn.addStretch(1)
@@ -231,6 +274,15 @@ class SettingsDialog(QDialog):
         self.spn_edge.setSuffix(suffix)
         self.spn_vertex.setSuffix(suffix)
 
+    def _select_overlap(self, mode):
+        """Выбор режима перехлёста в комбобоксе (мусор -> «спрашивать»)."""
+        idx = 0
+        for i in range(self.cmb_overlap.count()):
+            if self.cmb_overlap.itemData(i) == mode:
+                idx = i
+                break
+        self.cmb_overlap.setCurrentIndex(idx)
+
     def _update_tol_warning(self):
         """Предупреждение: «строгий» радиус узлов меньше радиуса рёбер."""
         self.lbl_warn.setVisible(
@@ -245,6 +297,8 @@ class SettingsDialog(QDialog):
         self.spn_edge.setValue(settings.DEFAULT_EDGE_TOL)
         self.spn_vertex.setValue(settings.DEFAULT_VERTEX_TOL)
         self._set_all_checked(True)
+        self.chk_hints.setChecked(settings.DEFAULT_SHOW_HINTS)
+        self._select_overlap(settings.DEFAULT_OVERLAP_MODE)
 
     def current_config(self):
         """Текущее состояние диалога в виде конфига settings.save_settings."""
@@ -256,6 +310,11 @@ class SettingsDialog(QDialog):
                       (settings.UNITS_PX, settings.UNITS_MAP)
                       else settings.UNITS_PX),
             "disabled": self._disabled_ids(),
+            "overlap_mode": (self.cmb_overlap.currentData()
+                             if self.cmb_overlap.currentData() in
+                             settings.OVERLAP_MODES
+                             else settings.DEFAULT_OVERLAP_MODE),
+            "show_hints": self.chk_hints.isChecked(),
         }
 
     def apply(self):

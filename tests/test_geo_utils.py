@@ -61,6 +61,11 @@ class QgsRectangle(object):
     def __init__(self, *a):
         if len(a) == 4:
             self.xmin, self.ymin, self.xmax, self.ymax = float(a[0]), float(a[1]), float(a[2]), float(a[3])
+        elif len(a) == 1 and isinstance(a[0], QgsRectangle):
+            # реальный API допускает копию QgsRectangle(other)
+            s = a[0]
+            self.xmin, self.ymin = s.xmin, s.ymin
+            self.xmax, self.ymax = s.xmax, s.ymax
         else:
             self.xmin = self.ymin = self.xmax = self.ymax = 0.0
 
@@ -69,6 +74,12 @@ class QgsRectangle(object):
         self.ymin -= m
         self.xmax += m
         self.ymax += m
+
+    def width(self):
+        return self.xmax - self.xmin
+
+    def height(self):
+        return self.ymax - self.ymin
 
     def combineExtentWith(self, r):
         self.xmin = min(self.xmin, r.xmin)
@@ -86,6 +97,8 @@ class QgsWkbTypes(object):
     LineGeometry = 1
     PointGeometry = 2
     NullGeometry = 3
+    UnknownGeometry = 4
+    GeometryCollection = 5
 
 
 class QgsFeatureRequest(object):
@@ -199,6 +212,13 @@ class QgsGeometry(object):
                    "lines": [list(pts)]}
         return g
 
+    @classmethod
+    def fromMultiPointXY(cls, pts):
+        g = cls()
+        g._data = {"type": QgsWkbTypes.PointGeometry, "multi": True,
+                   "points": [list(pts)]}
+        return g
+
     def isNull(self):
         return self._data is None
 
@@ -285,7 +305,19 @@ qtgui_mod = types.ModuleType("qgis.PyQt.QtGui")
 
 class QColor(object):
     def __init__(self, *a):
-        pass
+        if len(a) >= 3:
+            self._rgb = (a[0], a[1], a[2])
+        else:
+            self._rgb = (0, 0, 0)
+
+    def red(self):
+        return self._rgb[0]
+
+    def green(self):
+        return self._rgb[1]
+
+    def blue(self):
+        return self._rgb[2]
 
 
 qtgui_mod.QColor = QColor
@@ -340,6 +372,9 @@ class QgsVertexMarker(object):
     def setIconType(self, t):
         pass
 
+    def setIconSize(self, size):
+        pass
+
     def setColor(self, c):
         pass
 
@@ -357,6 +392,9 @@ class QgsVertexMarker(object):
 
 
 class QgsRubberBand(object):
+    ICON_BOX = 0  # как в реальном API (плоский доступ) — hints-ленты
+    ICON_CIRCLE = 1
+
     def __init__(self, canvas, gtype=None):
         self.geom = None
 
@@ -367,6 +405,12 @@ class QgsRubberBand(object):
         pass
 
     def setWidth(self, w):
+        pass
+
+    def setIcon(self, icon):
+        pass
+
+    def setIconSize(self, size):
         pass
 
     def reset(self, gtype):
@@ -922,12 +966,13 @@ check("snap полигон: исключённая фича игнорирует
       v is None and e is None)
 
 # --- 17c: приоритет узел > ребро ---
-r = se.SnappingEngine._pick((9.0, pt(1, 1), "L", 1),
-                            (1.0, pt(2, 2), "L", 2))
+r = se.SnappingEngine._pick((9.0, pt(1, 1), "L", 1, []),
+                            (1.0, pt(2, 2), "L", 2, (pt(0, 0), pt(4, 4)), []))
 check("приоритет: узел побеждает ребро, даже если ребро ближе",
       r is not None and r.snap_type == "vertex" and
       abs(r.point.x() - 1.0) < 1e-9)
-r = se.SnappingEngine._pick(None, (1.0, pt(2, 2), "L", 2, (pt(0, 0), pt(4, 4))))
+r = se.SnappingEngine._pick(None, (1.0, pt(2, 2), "L", 2,
+                                   (pt(0, 0), pt(4, 4)), []))
 check("приоритет: без узла берётся ребро",
       r is not None and r.snap_type == "edge" and
       abs(r.point.x() - 2.0) < 1e-9)
@@ -989,9 +1034,11 @@ check("18c save: True при сохранении",
       st.save_settings({"edge_tol": 4.5, "vertex_tol": 6.5,
                         "units": st.UNITS_MAP,
                         "disabled": ["a", "b"]}) is True)
-check("18c load: значения совпадают",
+check("18c load: значения совпадают (новые ключи — дефолты)",
       st.load_settings() == {"edge_tol": 4.5, "vertex_tol": 6.5,
-                             "units": st.UNITS_MAP, "disabled": ["a", "b"]})
+                             "units": st.UNITS_MAP, "disabled": ["a", "b"],
+                             "overlap_mode": st.OVERLAP_ASK,
+                             "show_hints": True})
 check("18c disabled_layer_ids: множество {'a','b'}",
       st.disabled_layer_ids() == {"a", "b"})
 
@@ -1329,8 +1376,14 @@ check("21 edge: сигнатура _update_preview — (self, d_map), один �
 class _FakeSnapEngine(object):
     """Изолирует тест от снэппинга: snap() всегда None."""
 
-    def snap(self, point, exclude=None, editable_layer=None):
+    hints = {"near": [], "target": []}
+
+    def snap(self, point, exclude=None, editable_layer=None,
+             accumulate_hints=False):
         return None
+
+    def reset_hints(self):
+        pass
 
 
 etool.drag = {
@@ -1340,6 +1393,7 @@ etool.drag = {
     "press_map": pt(0, 0),
     "press_layer": pt(0, 0),
     "eps": 0.5,
+    "match_eps": 1e-6,
     "ct_m2l": QgsCoordinateTransform(),
     "ct_l2m": QgsCoordinateTransform(),
     "entries": [],
@@ -1359,29 +1413,246 @@ etool.drag = None
 etool._cleanup()
 
 # ---------------------------------------------------------------------------
-# 22. Подсветка узла-цели при привязке (v1.4.2): при привязке к вершине
-#     (в т.ч. узлу эталонного слоя) поверх кружка показывается крест.
+# 22. Подсветка вершин прилипания + перехлёст (v1.5.0): hints рисуются
+#     и без привязки («куда целиться»); cleanup сбрасывает ленты, hints
+#     движка и красную область; заметки отчёта о перехлёсте.
 # ---------------------------------------------------------------------------
-tool.snap_vertex_marker.show()
+tool.engine.hints = {"near": [pt(1, 1)],
+                     "target": [pt(2, 2), pt(3, 3)]}
 tool._show_snap_feedback(None)
-check("22 фидбек: None прячет и подсветку узла",
-      tool.snap_marker._visible is False and
-      tool.snap_vertex_marker._visible is False)
+check("22 hints: подсветка рисуется и без привязки (куда целиться)",
+      tool.hint_near.geom is not None and
+      tool.hint_target.geom is not None)
 
 tool._show_snap_feedback(snap_v)
-check("22 фидбек: vertex — крест узла-цели в точке привязки",
-      tool.snap_vertex_marker._visible is True and
-      tool.snap_vertex_marker._center == snap_v.point)
+check("22 hints: при vertex-привязке кружок точки и подсветка на месте",
+      tool.snap_marker._visible is True and
+      tool.hint_target.geom is not None)
 
-tool._show_snap_feedback(snap_e)
-check("22 фидбек: edge — подсветка узла скрыта, линия сегмента видна",
-      tool.snap_vertex_marker._visible is False and
-      tool.snap_seg.geom is not None)
-
-tool.snap_vertex_marker.show()
 tool._cleanup()
-check("22 cleanup: подсветка узла сбрасывается",
-      tool.snap_vertex_marker._visible is False)
+check("22 hints: cleanup сбрасывает ленты, hints движка и красную область",
+      tool.hint_near.geom is None and tool.hint_target.geom is None and
+      tool.overlap_rb.geom is None and
+      tool.engine.hints == {"near": [], "target": []})
+
+tool.engine.hints = {"near": [pt(5, 5)], "target": []}
+tool._show_hints()
+tool._reset_hints()
+check("22 hints: _reset_hints чистит ленты и hints движка",
+      tool.hint_near.geom is None and
+      tool.engine.hints == {"near": [], "target": []})
+
+rep = {"neighbors_clipped": 2, "overlaps": 3,
+       "overlap_choice": tb.CHOICE_KEEP}
+parts = tool._overlap_notes(rep)
+check("22 перехлёст: заметки отчёта (обрезано соседей / оставлен)",
+      parts == [u"обрезано соседей: 2",
+                u"перехлёст с 3 объектами оставлен"])
+
+check("22 перехлёст: без событий — пустой список заметок",
+      tool._overlap_notes({}) == [])
+
+iface20.bar.messages = []
+tool._push_cancelled()
+check("22 перехлёст: сообщение об отмене правки в message bar",
+      iface20.bar.messages[-1][2] == Qgis.Info and
+      u"отменена" in iface20.bar.messages[-1][1])
+
+# ---------------------------------------------------------------------------
+# 23. Новое в v1.5.0: перехлёст с объектами своего слоя и подсветка.
+#     polygon_only / union_bbox / find_overlaps / preview_overlaps /
+#     _decide_overlap / collect_matching_points / enum_member.
+# ---------------------------------------------------------------------------
+import topopolyedit.geo_utils as tegu  # noqa: E402  (импорт пакета, не gu)
+
+
+class _OvInter(object):
+    """Результат intersection: полигон с площадью (утиная типизация)."""
+
+    def __init__(self, area):
+        self._area = area
+
+    def isNull(self):
+        return False
+
+    def isEmpty(self):
+        return False
+
+    def type(self):
+        return QgsWkbTypes.PolygonGeometry
+
+    def area(self):
+        return self._area
+
+
+class _OvGeom(object):
+    """Утиная геометрия: bbox + площадь + пересечение по запросу."""
+
+    def __init__(self, x0, y0, x1, y1, area, inter_area=None):
+        self.bb = QgsRectangle(x0, y0, x1, y1)
+        self._area = area
+        self._inter_area = inter_area
+        self.intersection_calls = 0
+
+    def boundingBox(self):
+        return self.bb
+
+    def area(self):
+        return self._area
+
+    def isNull(self):
+        return False
+
+    def isEmpty(self):
+        return False
+
+    def isGeosValid(self):
+        return True
+
+    def type(self):
+        return QgsWkbTypes.PolygonGeometry
+
+    def intersects(self, other):
+        return self._inter_area is not None and \
+            self.bb.intersects(other.bb)
+
+    def intersection(self, other):
+        self.intersection_calls += 1
+        if self._inter_area is None:
+            return None
+        return _OvInter(self._inter_area)
+
+
+# --- 23a: polygon_only ---
+check("23a polygon_only: None и пустой -> None",
+      te.polygon_only(None) is None and
+      te.polygon_only(QgsGeometry()) is None)
+g_poly = QgsGeometry.fromPolygonXY([ring((0, 0), (1, 0), (1, 1))])
+check("23a polygon_only: полигон возвращается как есть",
+      te.polygon_only(g_poly) is g_poly)
+g_line = QgsGeometry.fromPolylineXY([pt(0, 0), pt(1, 1)])
+check("23a polygon_only: не-полигон без коллекции -> None",
+      te.polygon_only(g_line) is None)
+
+
+class _Coll(object):
+    def __init__(self, parts):
+        self._parts = parts
+
+    def isNull(self):
+        return False
+
+    def isEmpty(self):
+        return False
+
+    def type(self):
+        return QgsWkbTypes.UnknownGeometry
+
+    def asGeometryCollection(self):
+        return self._parts
+
+
+coll_one = _Coll([_OvGeom(0, 0, 1, 1, 1.0), g_line])
+check("23a polygon_only: коллекция с 1 полигонной частью -> эта часть",
+      te.polygon_only(_Coll([g_poly, g_line])) is g_poly)
+check("23a polygon_only: коллекция только из линий -> None",
+      te.polygon_only(_Coll([g_line])) is None)
+
+# --- 23b: union_bbox ---
+b = te.union_bbox([_OvGeom(0, 0, 1, 1, 1.0), _OvGeom(3, 2, 5, 4, 1.0)])
+check("23b union_bbox: общий габарит двух геометрий",
+      b is not None and b.xmin == 0 and b.ymin == 0 and
+      b.xmax == 5 and b.ymax == 4)
+check("23b union_bbox: пустой список -> None",
+      te.union_bbox([]) is None)
+
+# --- 23c: find_overlaps ---
+moved = _OvGeom(0, 0, 2, 2, 4.0, inter_area=1.0)
+neigh = _OvGeom(1, 1, 3, 3, 4.0)
+res = te.find_overlaps([(1, moved)], [(10, neigh)])
+check("23c find_overlaps: перехлёст найден с полями пары",
+      len(res) == 1 and res[0]["moved"] == 1 and
+      res[0]["neighbor"] == 10 and abs(res[0]["area"] - 1.0) < 1e-12 and
+      res[0]["geom"] is not None)
+sliver = _OvGeom(0, 0, 2, 2, 4.0, inter_area=1e-12)
+check("23c find_overlaps: шов (площадь < порога) не перехлёст",
+      te.find_overlaps([(1, sliver)], [(10, neigh)]) == [])
+apart = _OvGeom(0, 0, 1, 1, 1.0, inter_area=None)
+check("23c find_overlaps: далеко друг от друга — intersection не зовётся",
+      te.find_overlaps([(1, apart)], [(10, _OvGeom(5, 5, 6, 6, 1.0))]) == [] and
+      apart.intersection_calls == 0)
+check("23c find_overlaps: intersection -> None не даёт записи",
+      te.find_overlaps([(1, _OvGeom(0, 0, 2, 2, 4.0, inter_area=None))],
+                       [(10, _OvGeom(1, 1, 3, 3, 4.0))]) == [])
+
+# --- 23d: preview_overlaps (ничего не пишет; exclude работает) ---
+lay_ov = _Layer([_Feat(10, _OvGeom(1, 1, 3, 3, 4.0))])
+ed_ov = te.TopoEditor(None, lay_ov)
+mg = _OvGeom(0, 0, 2, 2, 4.0, inter_area=1.0)
+check("23d preview_overlaps: перехлёст с соседом найден",
+      len(ed_ov.preview_overlaps([(1, mg)], {1})) == 1)
+check("23d preview_overlaps: сосед в exclude — перехлёста нет",
+      ed_ov.preview_overlaps([(1, mg)], {1, 10}) == [])
+
+# --- 23e: _decide_overlap (настройки + callback) ---
+QgsSettings._store.clear()
+ed_d = te.TopoEditor(None, lay_ov)
+st.save_settings({"overlap_mode": st.OVERLAP_CLIP})
+called = []
+ed_d.overlap_decider = lambda info: called.append(info) or st.CHOICE_CANCEL
+check("23e decide: режим «всегда обрезать» — callback не зовётся",
+      ed_d._decide_overlap([{"moved": 1, "neighbor": 2, "area": 1.0}]) == te.CHOICE_CLIP_MOVED and
+      called == [])
+st.save_settings({"overlap_mode": st.OVERLAP_KEEP})
+check("23e decide: режим «не обрезать» — CHOICE_KEEP без callback",
+      ed_d._decide_overlap([{"moved": 1, "neighbor": 2, "area": 1.0}]) == te.CHOICE_KEEP and called == [])
+st.save_settings({"overlap_mode": st.OVERLAP_ASK})
+ed_d.overlap_decider = lambda info: te.CHOICE_CLIP_NEIGHBORS
+check("23e decide: режим «спрашивать» — ответ callback'а",
+      ed_d._decide_overlap([{"moved": 1, "neighbor": 2, "area": 1.0}]) ==
+      te.CHOICE_CLIP_NEIGHBORS)
+ed_d.overlap_decider = lambda info: "мусор"
+check("23e decide: неизвестный ответ callback'а -> CANCEL",
+      ed_d._decide_overlap([{"moved": 1, "neighbor": 2, "area": 1.0}]) == te.CHOICE_CANCEL)
+
+
+def _boom(info):
+    raise RuntimeError("boom")
+
+
+ed_d.overlap_decider = _boom
+check("23e decide: сбой callback'а -> CANCEL (правку не применять вслепую)",
+      ed_d._decide_overlap([{"moved": 1, "neighbor": 2, "area": 1.0}]) == te.CHOICE_CANCEL)
+ed_d.overlap_decider = None
+check("23e decide: «спрашивать» без callback (offline) -> KEEP",
+      ed_d._decide_overlap([{"moved": 1, "neighbor": 2, "area": 1.0}]) == te.CHOICE_KEEP)
+
+# --- 23f: collect_matching_points ---
+sq = [[ring((0, 0), (2, 0), (2, 2), (0, 2))]]
+mm = tegu.collect_matching_points(sq, pt(0, 0), 1e-12)
+check("23f collect: вершина найдена, замыкающий дубликат не задвоен",
+      len(mm) == 1 and abs(mm[0].x()) < 1e-12 and abs(mm[0].y()) < 1e-12)
+check("23f collect: нет совпадения -> []",
+      tegu.collect_matching_points(sq, pt(5, 5), 1e-12) == [])
+two = [[ring((0, 0), (2, 0), (2, 2))],
+       [ring((0, 0), (0, 2), (-2, 2))]]
+mm2 = tegu.collect_matching_points(two, pt(0, 0), 1e-12)
+check("23f collect: вершина в двух кольцах смежных полигонов — один раз",
+      len(mm2) == 1)
+
+# --- 23g: enum_member (PyQt5-плоский и PyQt6-областной доступ) ---
+check("23g enum_member: плоский доступ (QgsRubberBand.ICON_BOX)",
+      ut.enum_member(QgsRubberBand, "IconType", "ICON_BOX") ==
+      QgsRubberBand.ICON_BOX)
+
+
+class _EnumOwner(object):
+    class IconType(object):
+        ICON_BOX = 77
+
+
+check("23g enum_member: областной доступ (PyQt6-стиль)",
+      ut.enum_member(_EnumOwner, "IconType", "ICON_BOX") == 77)
 
 # ---------------------------------------------------------------------------
 print("")

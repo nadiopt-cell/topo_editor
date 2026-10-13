@@ -35,6 +35,23 @@ def log(message, level=None):
         pass
 
 
+def enum_member(owner, enum_name, member):
+    """Член enum Qt/QGIS для PyQt5 и PyQt6 одним вызовом.
+
+    PyQt5/QGIS 3: ``QgsRubberBand.ICON_BOX``; PyQt6/QGIS 4 требует
+    ``QgsRubberBand.IconType.ICON_BOX``. Сначала пробуется «с областью»
+    (работает там, где она поддержана), затем прежний плоский доступ.
+
+    :param owner: класс-владелец (QgsRubberBand, QMessageBox, ...)
+    :param enum_name: имя enum («IconType», «ButtonRole», ...)
+    :param member: имя члена («ICON_BOX», «AcceptRole», ...)
+    """
+    scope = getattr(owner, enum_name, None)
+    if scope is not None and hasattr(scope, member):
+        return getattr(scope, member)
+    return getattr(owner, member)
+
+
 def is_polygon_layer(layer):
     """True — это корректный полигональный векторный слой."""
     return (isinstance(layer, QgsVectorLayer) and layer.isValid()

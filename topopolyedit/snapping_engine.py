@@ -21,6 +21,12 @@
 Слои изменяться не могут — движок возвращает только точки привязки
 (модифицируется лишь редактируемый слой).
 
+ПОДСВЕТКА: за тот же проход по слоям движок собирает self.hints —
+вершины эталонных слоёв в радиусе HINT_RADIUS_FACTOR * допуск вокруг
+курсора ("near") и все вершины объекта, к которому нашлась привязка
+("target"). Инструменты рисуют их (см. topo_tool_base). Отключается
+флагом «Подсвечивать вершины…» в настройках.
+
 Список слоёв строится РУЧНЫМ обходом дерева панели слоёв (по галочкам
 видимости) с дополнительным источником checkedLayers(): раньше список
 зависел только от checkedLayers(), и если метод недоступен или вёл себя
@@ -37,7 +43,7 @@
 import time
 
 from qgis.core import (
-    QgsProject, QgsFeatureRequest, QgsCoordinateTransform,
+    QgsProject, QgsFeatureRequest, QgsCoordinateTransform, QgsGeometry,
     QgsPointXY, QgsRectangle, QgsWkbTypes, QgsUnitTypes,
     QgsMapLayerType, QgsVectorLayer, QgsLayerTreeNode,
 )
@@ -51,6 +57,13 @@ from . import utils
 TOLERANCE_PX = settings.DEFAULT_EDGE_TOL          # рёбра, px
 VERTEX_TOLERANCE_PX = settings.DEFAULT_VERTEX_TOL  # узлы (строгий снэп), px
 MAX_FEATURES_PER_LAYER = 20000  # предохранитель от слишком тяжёлых запросов
+
+# Подсветка вершин слоёв прилипания (см. SnappingEngine.hints):
+# радиус показа вершин вокруг курсора = HINT_RADIUS_FACTOR * max(допуски),
+# т.е. по умолчанию 4 * 15 px = 60 px.
+HINT_RADIUS_FACTOR = 4.0
+MAX_HINT_POINTS = 300     # вершин-кандидатов рядом с курсором (ближайшие)
+MAX_TARGET_POINTS = 500   # вершин объекта, к которому прилипаем
 
 # TTL кэша списка включённых слоёв, секунды. Достаточно мал, чтобы
 # изменения видимости/состава слоёв подхватывались практически сразу;
@@ -166,14 +179,18 @@ def get_snap_layers(editable_layer=None):
 class SnapResult(object):
     """Результат прилипания (точка в CRS карты)."""
 
-    __slots__ = ("point", "snap_type", "layer", "fid", "segment")
+    __slots__ = ("point", "snap_type", "layer", "fid", "segment",
+                 "target_pts")
 
-    def __init__(self, point, snap_type, layer=None, fid=None, segment=None):
+    def __init__(self, point, snap_type, layer=None, fid=None, segment=None,
+                 target_pts=None):
         self.point = point            # QgsPointXY (CRS карты)
         self.snap_type = snap_type    # "vertex" | "edge"
         self.layer = layer            # QgsVectorLayer или None
         self.fid = fid                # ID фичи или None
         self.segment = segment        # (a, b) QgsPointXY для рёбер
+        # все вершины объекта-цели (CRS карты) — для подсветки
+        self.target_pts = target_pts
 
 
 class SnappingEngine(object):
@@ -189,6 +206,10 @@ class SnappingEngine(object):
         self.canvas = canvas
         self.tolerance_px = (float(tolerance_px)
                              if tolerance_px is not None else None)
+        # Подсказки последнего поиска (CRS карты), их рисует инструмент:
+        #   "near"   — вершины эталонных слоёв рядом с курсором (кандидаты);
+        #   "target" — все вершины объекта, к которому нашлась привязка.
+        self.hints = {"near": [], "target": []}
 
     # ------------------------------------------------------------------
     def _tols_map_units(self):
@@ -220,36 +241,74 @@ class SnappingEngine(object):
     def _pick(best_v, best_e):
         """Выбор итоговой привязки: узел ВСЕГДА важнее ребра."""
         if best_v is not None:
-            return SnapResult(best_v[1], "vertex", best_v[2], best_v[3])
+            return SnapResult(best_v[1], "vertex", best_v[2], best_v[3],
+                              None, best_v[4])
         if best_e is not None:
             return SnapResult(best_e[1], "edge", best_e[2], best_e[3],
-                              best_e[4])
+                              best_e[4], best_e[5])
         return None
 
     # ------------------------------------------------------------------
-    def snap(self, map_pt, exclude=None, editable_layer=None):
+    @staticmethod
+    def _dedupe_points(points, step):
+        """Убирает совпадающие точки (смежные полигоны дают вершины-двойники).
+
+        :param points: [QgsPointXY, ...] в нужном порядке (порядок сохраняется)
+        :param step: размер ячейки совпадения, единицы карты
+        """
+        if step <= 0.0:
+            step = 1e-9
+        seen = set()
+        out = []
+        for p in points:
+            key = (round(p.x() / step), round(p.y() / step))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
+
+    def reset_hints(self):
+        """Сбрасывает подсказки (вершины-кандидаты и вершины цели)."""
+        self.hints = {"near": [], "target": []}
+
+    def snap(self, map_pt, exclude=None, editable_layer=None,
+             accumulate_hints=False):
         """Поиск привязки для точки в CRS карты.
+
+        Побочный результат — self.hints: вершины эталонных слоёв рядом с
+        курсором и все вершины объекта, к которому нашлась привязка
+        (если подсветка включена в настройках). Подсказки собираются в ТОМ
+        ЖЕ проходе по слоям, что и привязка — отдельных запросов нет.
 
         :param map_pt: QgsPointXY — позиция курсора (CRS карты)
         :param exclude: множество (layer_id, fid) — фичи, к которым
                         прилипать нельзя (например, перемещаемые)
         :param editable_layer: редактируемый слой (гарантированно участвует)
+        :param accumulate_hints: True — дополнить self.hints, а не заменить
+                        (инструмент ребра привязывает два конца)
         :return: SnapResult или None
         """
         dest = self.canvas.mapSettings().destinationCrs()
         tol, tol_v = self._tols_map_units()
         tol2 = tol * tol
         tol_v2 = tol_v * tol_v
-        reach = max(tol, tol_v)
+        hints_on = settings.show_snap_hints()
+        show_r = HINT_RADIUS_FACTOR * max(tol, tol_v) if hints_on else 0.0
+        show2 = show_r * show_r
+        near = [] if hints_on else None   # [(d2, QgsPointXY)]
+        reach = max(tol, tol_v, show_r)
         rect_map = QgsRectangle(map_pt.x() - reach, map_pt.y() - reach,
                                 map_pt.x() + reach, map_pt.y() + reach)
-        best_v = None   # (d2, point, layer, fid)
-        best_e = None   # (d2, proj, layer, fid, (a, b))
+        best_v = None   # (d2, point, layer, fid, pts)
+        best_e = None   # (d2, proj, layer, fid, (a, b), pts)
+        if not accumulate_hints:
+            self.reset_hints()
 
         for lyr in get_snap_layers(editable_layer):
             try:
                 res = self._snap_layer(lyr, map_pt, rect_map, dest,
-                                       exclude, tol2, tol_v2)
+                                       exclude, tol2, tol_v2, show2, near)
             except Exception as exc:
                 utils.log(u"Слой «{}» пропущен при поиске привязки: {}"
                           .format(lyr.name(), exc))
@@ -263,16 +322,29 @@ class SnappingEngine(object):
             if e is not None and (best_e is None or e[0] < best_e[0]):
                 best_e = e
 
-        return self._pick(best_v, best_e)
+        result = self._pick(best_v, best_e)
+
+        if hints_on:
+            step = max(tol, tol_v) * 1e-3
+            near.sort(key=lambda item: item[0])
+            pts_near = self._dedupe_points([p for _d2, p in near], step)
+            self.hints["near"].extend(pts_near[:MAX_HINT_POINTS])
+            if result is not None and result.target_pts:
+                pts_t = self._dedupe_points(result.target_pts, step)
+                self.hints["target"].extend(pts_t[:MAX_TARGET_POINTS])
+        return result
 
     # ------------------------------------------------------------------
     def _snap_layer(self, lyr, map_pt, rect_map, dest_crs, exclude,
-                    tol2, tol_v2=None):
+                    tol2, tol_v2=None, show2=0.0, near=None):
         """Поиск по одному слою. Возвращает (best_vertex, best_edge).
 
         :param tol2: квадрат допуска для рёбер
         :param tol_v2: квадрат допуска для узлов (строгий снэп —
                        обычно больше tol2); None => равен tol2
+        :param show2: квадрат радиуса показа вершин-подсказок
+        :param near: список, в который добавляются (d2, point) вершин
+                     в радиусе показа; None — подсказки не собираются
         """
         if tol_v2 is None:
             tol_v2 = tol2
@@ -347,11 +419,13 @@ class SnappingEngine(object):
             for p in pts:
                 d2 = map_pt.sqrDist(p)
                 if d2 <= tol_v2 and (best_v is None or d2 < best_v[0]):
-                    best_v = (d2, p, lyr, feat.id())
+                    best_v = (d2, p, lyr, feat.id(), pts)
+                if near is not None and d2 <= show2:
+                    near.append((d2, p))
 
             for a, b in segs:
                 proj, d2, _t = point_to_segment(map_pt, a, b)
                 if d2 <= tol2 and (best_e is None or d2 < best_e[0]):
-                    best_e = (d2, proj, lyr, feat.id(), (a, b))
+                    best_e = (d2, proj, lyr, feat.id(), (a, b), pts)
 
         return best_v, best_e

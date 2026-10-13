@@ -4,7 +4,8 @@
 Клик по ребру полигонального слоя:
   * узел вставляется во ВСЕ полигоны редактируемого слоя, содержащие
     это ребро — в том числе при T-образных примыканиях;
-  * точка вставки учитывает прилипание ко всем включенным слоям;
+  * точка вставки учитывает прилипание ко всем включенным слоям; при
+    наведении подсвечиваются вершины слоёв прилипания и итоговая точка;
   * Esc — выход из инструмента.
 """
 
@@ -14,7 +15,8 @@ from qgis.gui import QgsVertexMarker, QgsRubberBand
 from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
                        Qgis, QgsFeatureRequest)
 
-from .geo_utils import norm_polys, find_segment, point_to_segment
+from .geo_utils import (norm_polys, find_segment, point_to_segment,
+                        TOPO_MATCH_EPS)
 from .snapping_engine import get_snap_layers
 from .topo_editor import TopoEditor
 from .topo_tool_base import BaseTopoTool
@@ -76,9 +78,10 @@ class TopoAddVertexTool(BaseTopoTool):
         map_pt = e.mapPoint()
         seg = None
         ct_l2m = None
+        ct_m2l = None
         for layer in candidates:
             try:
-                pt_layer, eps, _ct_m2l, ct_l2m = utils.layer_tolerance(
+                pt_layer, eps, ct_m2l, ct_l2m = utils.layer_tolerance(
                     self.canvas(), layer, map_pt, kind="edge")
                 seg = self._find_segment(layer, pt_layer, eps)
             except Exception:
@@ -94,6 +97,19 @@ class TopoAddVertexTool(BaseTopoTool):
             pm = ct_l2m.transform(QgsPointXY(proj))
         except Exception:
             return
+        # Прилипание точки вставки — так же, как при клике: показываем
+        # вершины слоёв прилипания и ставим маркер в итоговую точку.
+        try:
+            snap = self.engine.snap(map_pt, exclude=None,
+                                    editable_layer=layer)
+            self._show_snap_feedback(snap)
+            if snap is not None:
+                src_layer = ct_m2l.transform(snap.point)
+                p2, _d2s, _ts = point_to_segment(src_layer, a, b)
+                pm = ct_l2m.transform(QgsPointXY(p2))
+        except Exception as exc:
+            utils.log(u"Вставка узла: сбой превью прилипания — {}"
+                      .format(exc))
         self.edge_rb.setToGeometry(QgsGeometry.fromPolylineXY([am, bm]), None)
         self.marker.setCenter(pm)
         self.marker.show()
@@ -163,7 +179,7 @@ class TopoAddVertexTool(BaseTopoTool):
             proj, _d2, _t = point_to_segment(src_layer, a, b)
 
             editor = TopoEditor(self.iface, layer)
-            report = editor.add_vertex_on_edge(a, b, proj, eps)
+            report = editor.add_vertex_on_edge(a, b, proj, TOPO_MATCH_EPS)
             self._report(report)
         except Exception as exc:
             self._push_error(exc)

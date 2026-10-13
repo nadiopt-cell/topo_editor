@@ -2,6 +2,8 @@
 """Настройки прилипания TopoPolyEdit (QgsSettings + значения по умолчанию).
 
 Хранит:
+  * режим обработки перехлёста с объектами ТОГО ЖЕ слоя (спросить /
+    всегда обрезать / не обрезать) и флаг подсветки вершин слоёв прилипания;
   * допуск прилипания к рёбрам (edge) и к узлам (vertex, «строгий» снэп);
   * единицы допуска: "px" (пиксели экрана) или "map" (единицы карты);
   * ЧЁРНЫЙ список слоёв-исключений: идентификаторы слоёв, к которым
@@ -26,14 +28,26 @@ KEY_EDGE_TOL = SNAP_SECTION + "/snap_edge_tol"
 KEY_VERTEX_TOL = SNAP_SECTION + "/snap_vertex_tol"
 KEY_UNITS = SNAP_SECTION + "/snap_units"
 KEY_DISABLED = SNAP_SECTION + "/snap_disabled_layers"
+KEY_OVERLAP_MODE = SNAP_SECTION + "/same_layer_overlap"
+KEY_SHOW_HINTS = SNAP_SECTION + "/show_snap_hints"
 
 # Единицы допуска
 UNITS_PX = "px"      # пиксели экрана
 UNITS_MAP = "map"    # единицы CRS карты
 
+# Что делать, если перемещаемые полигоны перекрывают другие объекты ТОГО ЖЕ
+# редактируемого слоя (перекрытия с эталонами других слоёв отсекаются как
+# раньше, автоматически):
+OVERLAP_ASK = "ask"    # спросить пользователя при отпускании кнопки мыши
+OVERLAP_CLIP = "clip"  # всегда обрезать перемещаемые полигоны по соседям
+OVERLAP_KEEP = "keep"  # ничего не обрезать, перехлёст оставить
+OVERLAP_MODES = (OVERLAP_ASK, OVERLAP_CLIP, OVERLAP_KEEP)
+
 # Значения по умолчанию (совпадают с прежними константами движка)
 DEFAULT_EDGE_TOL = 10.0    # рёбра, px
 DEFAULT_VERTEX_TOL = 15.0  # узлы (строгий снэп), px
+DEFAULT_OVERLAP_MODE = OVERLAP_ASK
+DEFAULT_SHOW_HINTS = True  # подсвечивать вершины слоёв прилипания
 
 # Границы допуска (в любых единицах)
 MIN_TOL = 0.1
@@ -94,16 +108,43 @@ def _clamp_units(value):
     return UNITS_PX
 
 
+def _clamp_overlap_mode(value):
+    """Только OVERLAP_*; всё прочее -> OVERLAP_ASK."""
+    if value in OVERLAP_MODES:
+        return value
+    return DEFAULT_OVERLAP_MODE
+
+
+def _as_bool(value, default):
+    """Булево из значения QgsSettings (бывает bool, 'true'/'false', 0/1)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+        return default
+    try:
+        return bool(int(value))
+    except Exception:
+        return default
+
+
 def load_settings():
     """Читает настройки; возвращает словарь с гарантированно годными полями:
       {"edge_tol": float, "vertex_tol": float,
-       "units": "px"|"map", "disabled": [str, ...]}
+       "units": "px"|"map", "disabled": [str, ...],
+       "overlap_mode": "ask"|"clip"|"keep", "show_hints": bool}
     """
     cfg = {
         "edge_tol": DEFAULT_EDGE_TOL,
         "vertex_tol": DEFAULT_VERTEX_TOL,
         "units": UNITS_PX,
         "disabled": [],
+        "overlap_mode": DEFAULT_OVERLAP_MODE,
+        "show_hints": DEFAULT_SHOW_HINTS,
     }
     qs = _qsettings()
     if qs is None:
@@ -128,6 +169,16 @@ def load_settings():
     try:
         cfg["disabled"] = parse_layer_ids(
             qs.value(KEY_DISABLED, "", type=str))
+    except Exception:
+        pass
+    try:
+        cfg["overlap_mode"] = _clamp_overlap_mode(
+            qs.value(KEY_OVERLAP_MODE, DEFAULT_OVERLAP_MODE, type=str))
+    except Exception:
+        pass
+    try:
+        cfg["show_hints"] = _as_bool(
+            qs.value(KEY_SHOW_HINTS, DEFAULT_SHOW_HINTS), DEFAULT_SHOW_HINTS)
     except Exception:
         pass
     return cfg
@@ -160,6 +211,10 @@ def save_settings(cfg):
             if s:
                 parts.append(s)
         qs.setValue(KEY_DISABLED, u",".join(parts))
+        qs.setValue(KEY_OVERLAP_MODE, _clamp_overlap_mode(
+            cfg.get("overlap_mode", DEFAULT_OVERLAP_MODE)))
+        qs.setValue(KEY_SHOW_HINTS, _as_bool(
+            cfg.get("show_hints", DEFAULT_SHOW_HINTS), DEFAULT_SHOW_HINTS))
         return True
     except Exception:
         return False
@@ -198,6 +253,34 @@ def _render_pixels():
     return QgsUnitTypes.RenderPixels
 
 
+def overlap_mode():
+    """Режим обработки перехлёста с объектами редактируемого слоя.
+
+    Читает ТОЛЬКО свой ключ (вызывается при перетаскивании часто).
+    :return: OVERLAP_ASK | OVERLAP_CLIP | OVERLAP_KEEP
+    """
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_OVERLAP_MODE
+    try:
+        return _clamp_overlap_mode(
+            qs.value(KEY_OVERLAP_MODE, DEFAULT_OVERLAP_MODE, type=str))
+    except Exception:
+        return DEFAULT_OVERLAP_MODE
+
+
+def show_snap_hints():
+    """True — подсвечивать вершины слоёв прилипания (читает только свой ключ)."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_SHOW_HINTS
+    try:
+        return _as_bool(qs.value(KEY_SHOW_HINTS, DEFAULT_SHOW_HINTS),
+                        DEFAULT_SHOW_HINTS)
+    except Exception:
+        return DEFAULT_SHOW_HINTS
+
+
 def disabled_layer_ids():
     """Множество id слоёв, исключённых из прилипания настройками."""
     cfg = load_settings()
@@ -223,7 +306,8 @@ def reset_to_defaults():
     if qs is None:
         return False
     try:
-        for key in (KEY_EDGE_TOL, KEY_VERTEX_TOL, KEY_UNITS, KEY_DISABLED):
+        for key in (KEY_EDGE_TOL, KEY_VERTEX_TOL, KEY_UNITS, KEY_DISABLED,
+                    KEY_OVERLAP_MODE, KEY_SHOW_HINTS):
             try:
                 qs.remove(key)
             except Exception:
@@ -236,4 +320,6 @@ def reset_to_defaults():
         "vertex_tol": DEFAULT_VERTEX_TOL,
         "units": UNITS_PX,
         "disabled": [],
+        "overlap_mode": DEFAULT_OVERLAP_MODE,
+        "show_hints": DEFAULT_SHOW_HINTS,
     })
