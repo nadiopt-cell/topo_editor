@@ -535,6 +535,9 @@ class TopoEditor(object):
                 else:
                     report["skipped"] += 1
         self.layer.endEditCommand()
+        # слой запоминается для кнопки «Отменить» (штатная отмена QGIS
+        # привязана к активному слою и может быть недоступна)
+        utils.note_edited_layer(self.layer)
         self.layer.triggerRepaint()
         return report
 
@@ -705,6 +708,7 @@ class TopoEditor(object):
                 if self.layer.changeGeometry(t["fid"], g):
                     report["features"] += 1
             self.layer.endEditCommand()
+            utils.note_edited_layer(self.layer)  # для кнопки «Отменить»
             self.layer.triggerRepaint()
         except Exception as exc:
             try:

@@ -115,6 +115,90 @@ def resolve_edit_layer(iface, offer_start=True, quiet=False):
     return layers[0] if layers else None
 
 
+# ---------------------------------------------------------------------------
+# Кнопка «Отменить» (v1.6.2)
+#
+# Штатная отмена QGIS (Правка -> Отменить, Ctrl+Z) привязана к АКТИВНОМУ
+# слою панели слоёв. Плагин же может править ЛЮБОЙ полигональный слой в
+# режиме редактирования (при нескольких слоях в правке инструмент выбирает
+# слой под курсором), поэтому штатная отмена часто остаётся серой, хотя
+# откатывать есть что. Плагин помнит последний изменённый им слой
+# (note_edited_layer вызывается ядром после каждой успешной операции) и
+# по нему находит цель отката — см. find_undo_target.
+# ---------------------------------------------------------------------------
+
+_last_edited_ref = []
+
+
+def note_edited_layer(layer):
+    """Запоминает последний слой, изменённый плагином (для «Отменить»).
+
+    Вызывается ядром (TopoEditor) после успешного endEditCommand.
+    Хранится одна ссылка: повторный вызов замещает предыдущее значение.
+    Ссылка «сильная»: удалённый из проекта слой распознаётся позже по
+    сбою обращения к C++ объекту (can_undo/find_undo_target гасят
+    RuntimeError и пропускают такой слой).
+    """
+    try:
+        del _last_edited_ref[:]
+        if layer is not None:
+            _last_edited_ref.append(layer)
+    except Exception:
+        pass
+
+
+def last_edited_layer():
+    """Последний слой, изменённый плагином, или None."""
+    try:
+        if _last_edited_ref:
+            return _last_edited_ref[0]
+    except Exception:
+        pass
+    return None
+
+
+def can_undo(layer):
+    """True — полигональный слой в правке и в его стеке отмены есть команды.
+
+    Устойчив к любому мусору (удалённый слой, не-слой, сбой C++ объекта):
+    в этом случае просто False — кнопка «Отменить» не должна падать.
+    """
+    try:
+        if not is_polygon_layer(layer) or not layer.isEditable():
+            return False
+        return bool(layer.undoStack().canUndo())
+    except Exception:
+        return False
+
+
+def find_undo_target(candidates, last_edited=None, active=None):
+    """Выбирает слой для кнопки «Отменить» (или None — откатывать нечего).
+
+    Порядок выбора — по свежести правок:
+      1) last_edited — последний слой, изменённый ПЛАГИНОМ (откатывает
+         именно последнюю операцию плагина, даже если слой не активен);
+      2) active — активный слой (правки сделаны штатными инструментами
+         QGIS или плагином на активном слое);
+      3) первый подходящий из candidates (произвольный слой в правке).
+    Подходящий = полигональный, в режиме редактирования,
+    undoStack().canUndo().
+
+    :param candidates: iterable слоёв проекта (обычно mapLayers().values())
+    :param last_edited: слой из last_edited_layer() (может быть None)
+    :param active: активный слой (может быть None)
+    """
+    for layer in (last_edited, active):
+        if can_undo(layer):
+            return layer
+    try:
+        for layer in candidates:
+            if can_undo(layer):
+                return layer
+    except Exception:
+        pass
+    return None
+
+
 def _grab_tolerance_map(canvas, kind):
     """Радиус захвата узла/ребра в единицах карты — из настроек плагина.
 

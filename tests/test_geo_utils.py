@@ -225,6 +225,15 @@ class QgsGeometry(object):
     def isEmpty(self):
         return self._data is None
 
+    def isGeosValid(self):
+        # v1.6.2: реальный API, зовётся из TopoEditor._apply_moves;
+        # геометрии, собранные стаб-конструкторами, считаем валидными
+        return self._data is not None
+
+    def makeValid(self):
+        # упрощение: валидный стаб-объект возвращаем как есть (копию)
+        return QgsGeometry(self)
+
     def type(self):
         return self._data["type"]
 
@@ -2079,6 +2088,212 @@ stopped28b = ov28b._collect_layer(lyr_many, iface28b.canvas.extent(),
                                   dest28, raw28b, [])
 check("28 бюджет: без дедлайна слой собирается целиком",
       stopped28b is False and len(raw28b) == 4000)
+
+# ---------------------------------------------------------------------------
+# 29. Кнопка «Отменить» (v1.6.2). Штатная отмена QGIS привязана к
+#     АКТИВНОМУ слою, а плагин правит любой слой в режиме правки — поэтому
+#     ядро запоминает последний изменённый слой (note_edited_layer) и
+#     кнопка ищет цель отката: 1) последний слой плагина, 2) активный,
+#     3) любой подходящий (полигон, в правке, undoStack().canUndo()).
+# ---------------------------------------------------------------------------
+import topopolyedit.utils as ut  # noqa: E402  (псевдоним секции)
+
+
+class _UndoStack(object):
+    def __init__(self, can_undo):
+        self._can = can_undo
+        self.undone = 0
+
+    def canUndo(self):
+        return self._can
+
+    def undo(self):
+        if self._can:
+            self.undone += 1
+            self._can = False
+
+
+class _UndoLyr(QgsVectorLayer):
+    def __init__(self, name, editable, can_undo,
+                 gtype=QgsWkbTypes.PolygonGeometry):
+        self._name = name
+        self._gt = gtype
+        self._ed = editable
+        self.stack = _UndoStack(can_undo)
+
+    def name(self):
+        return self._name
+
+    def id(self):
+        return "id-" + self._name
+
+    def isValid(self):
+        return True
+
+    def geometryType(self):
+        return self._gt
+
+    def isEditable(self):
+        return self._ed
+
+    def undoStack(self):
+        return self.stack
+
+
+class _DeadLyr(QgsVectorLayer):
+    """Слой, удалённый из проекта: обращение к C++ объекту падает."""
+
+    def __getattr__(self, item):
+        raise RuntimeError(
+            "wrapped C/C++ object of type QgsVectorLayer has been deleted")
+
+
+ut.note_edited_layer(None)
+check("29 note/last: после сброса last_edited_layer() -> None",
+      ut.last_edited_layer() is None)
+
+la = _UndoLyr("L-A", True, True)
+lb = _UndoLyr("L-B", True, True)
+ut.note_edited_layer(la)
+check("29 note/last: note_edited_layer запоминает слой",
+      ut.last_edited_layer() is la)
+ut.note_edited_layer(lb)
+check("29 note/last: повторный вызов замещает предыдущий слой",
+      ut.last_edited_layer() is lb)
+
+check("29 цель: последний слой плагина побеждает активный",
+      ut.find_undo_target([lb, la], last_edited=la, active=lb) is la)
+check("29 цель: активный слой, если плагин ничего не менял",
+      ut.find_undo_target([lb, la], last_edited=None, active=la) is la)
+check("29 цель: без памяти и активного — первый слой в правке с историей",
+      ut.find_undo_target([lb, la], last_edited=None, active=None) is lb)
+check("29 цель: все негодны (не в правке / пустой стек) -> None",
+      ut.find_undo_target([_UndoLyr("L-C", False, True),
+                           _UndoLyr("L-D", True, False)],
+                          last_edited=None, active=None) is None)
+check("29 цель: неполигональный слой (линия) не цель отката",
+      ut.find_undo_target(
+          [_UndoLyr("L-line", True, True, QgsWkbTypes.LineGeometry)],
+          last_edited=None, active=None) is None)
+check("29 цель: кандидатов нет вовсе -> None",
+      ut.find_undo_target([], last_edited=None, active=None) is None)
+
+dead = _DeadLyr()
+check("29 цель: удалённый слой (RuntimeError) молча пропускается",
+      ut.find_undo_target([dead, la], last_edited=dead, active=None) is la)
+check("29 can_undo: удалённый слой -> False (без исключения)",
+      ut.can_undo(dead) is False)
+check("29 can_undo: None -> False", ut.can_undo(None) is False)
+check("29 can_undo: слой вне правки -> False",
+      ut.can_undo(_UndoLyr("L-off", False, True)) is False)
+
+
+# --- хук ядра: после успешной операции запомнен редактируемый слой -------
+class _UndoCrs(object):
+    def authid(self):
+        return "EPSG:4326"
+
+
+class _UndoFeat(object):
+    def __init__(self, fid, geom):
+        self._fid = fid
+        self._g = geom
+
+    def id(self):
+        return self._fid
+
+    def geometry(self):
+        return self._g
+
+
+class _UndoEditLyr(object):
+    """Фейковый слой правки: чтение фич + запись edit-командами."""
+
+    def __init__(self, feats):
+        self._feats = feats
+        self.stack = _UndoStack(True)
+        self.commands = []
+        self.written = {}
+        self.repainted = 0
+
+    def id(self):
+        return "L-edit"
+
+    def name(self):
+        return "L-edit"
+
+    def isValid(self):
+        return True
+
+    def crs(self):
+        return _UndoCrs()
+
+    def geometryType(self):
+        return QgsWkbTypes.PolygonGeometry
+
+    def isEditable(self):
+        return True
+
+    def undoStack(self):
+        return self.stack
+
+    def getFeatures(self, req):
+        return list(self._feats)
+
+    def beginEditCommand(self, text):
+        self.commands.append(("begin", text))
+
+    def endEditCommand(self):
+        self.commands.append(("end", None))
+
+    def destroyEditCommand(self):
+        self.commands.append(("destroy", None))
+
+    def changeGeometry(self, fid, g):
+        self.written[fid] = g
+        return True
+
+    def triggerRepaint(self):
+        self.repainted += 1
+
+
+# проект без других слоёв: эталонов для автоотсечения нет
+QgsProject._inst = _FakeProject(_TreeRoot(children=[]))
+
+feat_a = _UndoFeat(1, QgsGeometry.fromPolygonXY(
+    [ring((0, 0), (2, 0), (2, 2), (2, 4), (0, 4))]))
+feat_b = _UndoFeat(2, QgsGeometry.fromPolygonXY(
+    [ring((2, 0), (5, 0), (5, 4), (2, 4), (2, 2))]))
+
+ed_layer = _UndoEditLyr([feat_a, feat_b])
+ut.note_edited_layer(None)
+ed2 = te.TopoEditor(None, ed_layer)
+rep = ed2.move_vertex(pt(2, 2), pt(3, 3))
+check("29 хук: move_vertex применился (A и B обновлены)",
+      rep["error"] is None and rep["moved"] == 2 and
+      len(ed_layer.written) == 2)
+check("29 хук: после успешной move_vertex last_edited_layer() — слой правки",
+      ut.last_edited_layer() is ed_layer)
+
+ed_layer2 = _UndoEditLyr([feat_a])
+ut.note_edited_layer(None)
+ed3 = te.TopoEditor(None, ed_layer2)
+rep3 = ed3.move_vertex(pt(0, 0), pt(1, 1))
+check("29 хук: правка другого слоя замещает запомненный",
+      rep3["error"] is None and ut.last_edited_layer() is ed_layer2)
+
+rep4 = ed3.move_vertex(pt(0, 0), pt(0, 0))
+check("29 хук: операция без смещения — ошибка, слой-цель не меняется",
+      rep4["error"] == u"узел не смещён" and
+      ut.last_edited_layer() is ed_layer2)
+
+ed_layer3 = _UndoEditLyr([feat_a, feat_b])
+ut.note_edited_layer(None)
+ed4 = te.TopoEditor(None, ed_layer3)
+rep5 = ed4.add_vertex_on_edge(pt(2, 0), pt(2, 2), pt(2, 1))
+check("29 хук: add_vertex_on_edge применился и запомнил слой",
+      rep5["error"] is None and rep5["features"] >= 1 and
+      ut.last_edited_layer() is ed_layer3)
 
 # ---------------------------------------------------------------------------
 print("")
