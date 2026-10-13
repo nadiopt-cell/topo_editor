@@ -16,8 +16,20 @@
 Пересчёт: по включению, по изменению экстента карты (пан/зум, с
 дебаунсом REFRESH_DELAY_MS) и по layerModified подключенных слоёв —
 правки слоя сразу отражаются в аудите. Сбор ограничен видимой
-областью и предохранителями node_audit (MAX_NODES/MAX_SEGS); при
-усечении пользователь получает подсказку «приблизьте масштаб».
+областью, предохранителями node_audit (MAX_NODES/MAX_SEGS) и БЮДЖЕТОМ
+ВРЕМЕНИ COLLECT_BUDGET_S: при нехватке бюджета сбор останавливается,
+картинка помечается усечённой и пользователь получает подсказку
+«приблизьте масштаб».
+
+НЕВМЕШАТЕЛЬСТВО В ИНТЕРФЕЙС (v1.6.1): пересбор собирает геометрию всех
+слоёв видимой области и на тяжёлых данных занимает заметное время, а
+выполняется в главном потоке. Чтобы это не подвешивало инструменты и
+диалоги, отложенный пересчёт ОТКЛАДЫВАЕТСЯ, пока открыт модальный
+диалог (например, «что делать с перехлёстом») или зажата кнопка мыши
+(перетаскивание узла/ребра, панорамирование): _scheduled_refresh
+проверяет это перед каждым запуском. Ленты рисуются с кэшем
+(DeviceCoordinateCache), чтобы статичная картинка аудита не
+перерисовывалась на каждый кадр перетаскивания.
 
 Геометрия собирается в CRS КАРТЫ (пороги eps_match/eps_touch заданы в
 единицах карты) — так же, как это делает SnappingEngine для подсказок.
@@ -31,6 +43,7 @@ import time
 
 from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtWidgets import QApplication
 from qgis.core import (
     QgsProject, QgsFeatureRequest, QgsCoordinateTransform, QgsGeometry,
     QgsPointXY, QgsWkbTypes, Qgis,
@@ -48,9 +61,11 @@ COLOR_REF = (40, 110, 255)    # синий — узлы слоёв прилип�
 COLOR_ERR = (230, 25, 25)     # красный — узел без пары на границе
 
 REFRESH_DELAY_MS = 300   # дебаунс пересчёта при пан/зуме
+COLLECT_BUDGET_S = 0.4   # бюджет времени пересбора ОДНОЙ группы слоёв
 WARN_INTERVAL = 10.0     # не чаще раза в столько секунд — подсказка об усечении
 MAX_FEATURES = 20000     # предохранитель объектов на слой (как в снэпе)
 DUP_EPS2 = 1e-12         # замыкающий дубликат кольца (как в geo_utils)
+_DEADLINE_EVERY = 64     # проверять бюджет не на каждой фиче, а раз в N
 
 TITLE = u"Аудит узлов"
 
@@ -113,8 +128,41 @@ class NodeAuditOverlay(object):
         except Exception:
             self._pending = False
 
+    def _busy(self):
+        """True — сейчас нельзя пересчитывать, интерфейс занят пользователем.
+
+        Пересбор на тяжёлых данных занимает заметное время в главном
+        потоке. Если он случится, пока открыт модальный диалог (например,
+        «что делать с перехлёстом» при отпускании кнопки) или пока зажата
+        кнопка мыши (перетаскивание узла/ребра, панорамирование),
+        интерфейс замрёт и инструменты покажутся сломанными. Такой запуск
+        откладывается (см. _scheduled_refresh).
+        """
+        try:
+            if QApplication.activeModalWidget() is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            # любая зажатая кнопка мыши -> флаги не равны 0 (NoButton = 0)
+            if int(QApplication.mouseButtons()) != 0:
+                return True
+        except Exception:
+            pass
+        return False
+
     def _scheduled_refresh(self):
+        """Пересчёт по таймеру; если сейчас нельзя — отложить ещё раз.
+
+        Запрос на пересчёт не теряется: пока интерфейс занят модальным
+        диалогом или зажатой мышью, таймер перезапускается каждые
+        REFRESH_DELAY_MS, и пересчёт выполняется сразу после освобождения
+        интерфейса.
+        """
         self._pending = False
+        if self._busy():
+            self.schedule_refresh()
+            return
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -192,17 +240,27 @@ class NodeAuditOverlay(object):
     # ------------------------------------------------------------------
 
     def _collect_group(self, layers, extent_map, dest_crs):
-        """Узлы и сегменты группы слоёв в CRS карты (+флаг усечения)."""
+        """Узлы и сегменты группы слоёв в CRS карты (+флаг усечения).
+
+        На группу выделяется бюджет времени COLLECT_BUDGET_S: если сбор
+        не уложился, группа помечается усечённой (пользователь получит
+        подсказку «приблизьте масштаб»), а оставшиеся слои группы
+        пропускаются — следующая группа при этом собирается со своим
+        бюджетом, чтобы в аудите всегда были ОБОЕ стороны стыка.
+        """
         raw_pts = []
         segs = []
         truncated = False
+        deadline = time.monotonic() + COLLECT_BUDGET_S
         for lyr in layers:
             if len(raw_pts) >= na.MAX_RAW_POINTS or len(segs) >= na.MAX_SEGS:
                 truncated = True
                 break
             try:
-                self._collect_layer(lyr, extent_map, dest_crs,
-                                    raw_pts, segs)
+                if self._collect_layer(lyr, extent_map, dest_crs,
+                                       raw_pts, segs, deadline):
+                    truncated = True
+                    break  # бюджет исчерпан — остальные слои группы позже
             except Exception as exc:
                 utils.log(u"{}: слой «{}» пропущен — {}".format(
                     TITLE, lyr.name(), exc))
@@ -215,8 +273,16 @@ class NodeAuditOverlay(object):
             truncated = True
         return pts, segs, truncated
 
-    def _collect_layer(self, lyr, extent_map, dest_crs, pts_out, segs_out):
-        """Вершины и сегменты одного слоя (в видимой области) в CRS карты."""
+    def _collect_layer(self, lyr, extent_map, dest_crs, pts_out, segs_out,
+                       deadline=None):
+        """Вершины и сегменты одного слоя (в видимой области) в CRS карты.
+
+        :param deadline: monotonic-время, до которого нужно уложиться;
+                         None — без ограничения. При исчерпании сбор
+                         останавливается (данные неполные).
+        :return: True — остановлено по бюджету времени (картинка неполная)
+        """
+        stopped = False
         same = lyr.crs().authid() == dest_crs.authid()
         ct = None
         rect_l = extent_map
@@ -233,6 +299,10 @@ class NodeAuditOverlay(object):
         for feat in lyr.getFeatures(req):
             cnt += 1
             if cnt > MAX_FEATURES:
+                break
+            if (deadline is not None and cnt % _DEADLINE_EVERY == 0
+                    and time.monotonic() > deadline):
+                stopped = True
                 break
             g = feat.geometry()
             if g is None or g.isNull() or g.isEmpty():
@@ -272,6 +342,7 @@ class NodeAuditOverlay(object):
                     pp = [p] if p is not None else []
                 for v in pp:
                     pts_out.append((v.x(), v.y()))
+        return stopped
 
     # ------------------------------------------------------------------
     # Отрисовка и сообщения
@@ -284,6 +355,16 @@ class NodeAuditOverlay(object):
         rb.setIcon(utils.enum_member(QgsRubberBand, "IconType", icon_name))
         rb.setIconSize(size)
         rb.setWidth(2)
+        # Кэш отрисовки: картинка аудита статична между пересчётами, и без
+        # кэша она перерисовывалась бы при каждом обновлении канвы
+        # (тысячи значков), подтормаживая инструменты. С кэшем Qt
+        # перерисовывает ленту только после её изменения.
+        try:
+            from qgis.PyQt.QtWidgets import QGraphicsItem
+            rb.setCacheMode(utils.enum_member(QGraphicsItem, "CacheMode",
+                                              "DeviceCoordinateCache"))
+        except Exception:
+            pass  # кэш недоступен — ленты работают как раньше
         return rb
 
     def _render(self, res):

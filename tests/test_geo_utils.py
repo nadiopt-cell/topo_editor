@@ -353,6 +353,24 @@ class QMessageBox(object):
 
 qtwidgets_mod.QMessageBox = QMessageBox
 
+
+class QApplication(object):
+    """Стаб QApplication: занятость интерфейса для проверки _busy (v1.6.1)."""
+
+    _modal = None    # активное модальное окно (None — нет)
+    _buttons = 0     # битовая маска зажатых кнопок мыши (0 — не зажато)
+
+    @staticmethod
+    def activeModalWidget():
+        return QApplication._modal
+
+    @staticmethod
+    def mouseButtons():
+        return QApplication._buttons
+
+
+qtwidgets_mod.QApplication = QApplication
+
 pyqt_mod = types.ModuleType("qgis.PyQt")
 pyqt_mod.__path__ = []
 
@@ -1981,6 +1999,86 @@ check("27 аудит-настройки: выключение сохраняет
       st.audit_enabled() is False)
 check("27 аудит-настройки: ключ изолирован от load_settings",
       "audit" not in str(st.load_settings()))
+
+# ---------------------------------------------------------------------------
+# 28. Невмешательство «Аудита узлов» в интерфейс (v1.6.1): отложенный
+#     пересчёт НЕ выполняется при открытом модальном диалоге или зажатой
+#     мыши (запрос не теряется — откладывается), сбор ограничен бюджетом
+#     времени; ленты создаются без кэша в стабах (setCacheMode гасится).
+# ---------------------------------------------------------------------------
+QgsProject._inst = _AuditProject(audit_root,
+                                 {"A-edit": lyr_edit, "B-ref": lyr_ref})
+se.invalidate_snap_layers_cache()
+QgsSettings._store.clear()
+QTimer.clear()
+ao.QApplication._modal = None
+ao.QApplication._buttons = 0
+
+ov28 = ao.NodeAuditOverlay(_AuditIface(lyr_edit))
+check("28 занятость: по умолчанию интерфейс свободен",
+      ov28._busy() is False)
+
+ao.QApplication._modal = object()
+check("28 занятость: открыт модальный диалог (например, перехлёст)",
+      ov28._busy() is True)
+ao.QApplication._modal = None
+
+ao.QApplication._buttons = 1
+check("28 занятость: зажата кнопка мыши (перетаскивание/пан)",
+      ov28._busy() is True)
+ao.QApplication._buttons = 0
+check("28 занятость: мышь отпущена — интерфейс снова свободен",
+      ov28._busy() is False)
+
+# --- запрос на пересчёт при занятом интерфейсе откладывается, не теряется ---
+ov28.enabled = True
+ov28._pending = False
+calls28 = []
+ov28.refresh = lambda *a, **kw: calls28.append(1)  # monkeypatch
+ao.QApplication._buttons = 1
+QTimer.clear()
+ov28.schedule_refresh()
+check("28 отложенный: сигнал ставит запрос в очередь",
+      ov28._pending is True and len(QTimer._shots) == 1)
+QTimer._shots[-1][1]()  # выстрел при зажатой мыши
+check("28 отложенный: занятый интерфейс — пересчёт отложен ещё раз",
+      calls28 == [] and ov28._pending is True and
+      len(QTimer._shots) == 2 and
+      QTimer._shots[-1][0] == ao.REFRESH_DELAY_MS)
+ao.QApplication._buttons = 0
+QTimer._shots[-1][1]()  # выстрел после отпускания кнопки
+check("28 отложенный: после освобождения интерфейса пересчёт выполнен",
+      calls28 == [1] and ov28._pending is False)
+ov28.enabled = False
+
+# --- бюджет времени: сбор останавливается, группа помечается усечённой ---
+many_feats = [_AuditFeat(i, QgsGeometry.fromPolygonXY(
+    [ring((0, 0), (4, 0), (4, 2), (0, 2))])) for i in range(1000)]
+lyr_many = _AuditLyr("A-many", many_feats, editable=True)
+iface28b = _AuditIface(lyr_many)
+ov28b = ao.NodeAuditOverlay(iface28b)
+dest28 = iface28b.canvas.mapSettings().destinationCrs()
+raw28 = []
+segs28 = []
+saved_budget = ao.COLLECT_BUDGET_S
+try:
+    stopped28 = ov28b._collect_layer(lyr_many, iface28b.canvas.extent(),
+                                     dest28, raw28, segs28,
+                                     time.monotonic() - 1.0)
+    check("28 бюджет: дедлайн в прошлом — сбор останавливается",
+          stopped28 is True and 0 < len(raw28) < 4000)
+    ao.COLLECT_BUDGET_S = -1.0
+    pts_g, segs_g, tr_g = ov28b._collect_group(
+        [lyr_many], iface28b.canvas.extent(), dest28)
+finally:
+    ao.COLLECT_BUDGET_S = saved_budget
+check("28 бюджет: _collect_group помечает усечение по времени",
+      tr_g is True and 0 < len(pts_g) < 4000 and 0 < len(segs_g) < 4000)
+raw28b = []
+stopped28b = ov28b._collect_layer(lyr_many, iface28b.canvas.extent(),
+                                  dest28, raw28b, [])
+check("28 бюджет: без дедлайна слой собирается целиком",
+      stopped28b is False and len(raw28b) == 4000)
 
 # ---------------------------------------------------------------------------
 print("")
