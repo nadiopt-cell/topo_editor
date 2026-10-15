@@ -348,7 +348,7 @@ class SnappingEngine(object):
         """
         if tol_v2 is None:
             tol_v2 = tol2
-        same = lyr.crs().authid() == dest_crs.authid()
+        same = lyr.crs() == dest_crs
         ct = None
         if same:
             rect_l = rect_map

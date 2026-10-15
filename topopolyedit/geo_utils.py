@@ -441,6 +441,50 @@ def translate_vertices(polys, anchors, delta, eps2):
     return new_polys, changed
 
 
+def translate_edge_vertices(polys, anchors, delta, eps2):
+    """Сдвигает якоря и промежуточные вершины на той же общей границе.
+
+    Границы смежных полигонов могут содержать дополнительные коллинеарные
+    вершины. Они сдвигаются вместе с ребром только если смежное ребро
+    кольца лежит на выбранной цепочке; иначе можно случайно сдвинуть
+    постороннюю вершину из дыры или соседнего полигона, оказавшуюся на той
+    же прямой. Вызывать только для полигонов, у которых заведомо есть хотя
+    бы один общий якорь.
+    """
+    dx, dy = delta
+    segments = list(zip(anchors, anchors[1:]))
+    new_polys = []
+    changed = 0
+    for part in polys:
+        new_part = []
+        for ring in part:
+            n = len(ring)
+            closed = n > 1 and ring[0].sqrDist(ring[-1]) <= DUP_EPS2
+            m = n - 1 if closed else n
+            new_ring = []
+            for i, v in enumerate(ring):
+                hit = any(v.sqrDist(anchor) <= eps2 for anchor in anchors)
+                if not hit and m >= 2:
+                    idx = i % m
+                    prev = ring[(idx - 1) % m]
+                    nxt = ring[(idx + 1) % m]
+                    for a, b in segments:
+                        if point_to_segment(v, a, b)[1] > eps2:
+                            continue
+                        if (point_to_segment(prev, a, b)[1] <= eps2 or
+                                point_to_segment(nxt, a, b)[1] <= eps2):
+                            hit = True
+                            break
+                if hit:
+                    new_ring.append(QgsPointXY(v.x() + dx, v.y() + dy))
+                    changed += 1
+                else:
+                    new_ring.append(QgsPointXY(v))
+            new_part.append(new_ring)
+        new_polys.append(new_part)
+    return new_polys, changed
+
+
 # ---------------------------------------------------------------------------
 # Габариты
 # ---------------------------------------------------------------------------

@@ -7,7 +7,9 @@
   * find_vertex / find_segment / point_to_segment;
   * insert_vertex_topo — точное ребро, T-надмножество, T-подмножество,
     защита от дубликатов;
-  * polys_bbox, contains_vertex.
+  * polys_bbox, contains_vertex;
+  * translate_edge_vertices — промежуточные вершины общей границы (v1.6.3);
+  * откат всей правки при сбое записи, лимиты аудита внутри одного фича.
 """
 import math
 import os
@@ -886,6 +888,11 @@ import topopolyedit.snapping_engine as se  # noqa: E402
 
 
 class _Crs(object):
+    def __eq__(self, other):
+        # v1.6.3: CRS сравниваются ОБЪЕКТАМИ (кастомные СК с пустым
+        # authid больше не считаются совпадающими)
+        return isinstance(other, _Crs) and self.authid() == other.authid()
+
     def __init__(self, authid):
         self._a = authid
 
@@ -900,6 +907,9 @@ class _SnapLyr(object):
         self._feats = feats
 
     def id(self):
+        return self._lid
+
+    def name(self):
         return self._lid
 
     def isValid(self):
@@ -2074,20 +2084,33 @@ try:
     stopped28 = ov28b._collect_layer(lyr_many, iface28b.canvas.extent(),
                                      dest28, raw28, segs28,
                                      time.monotonic() - 1.0)
-    check("28 бюджет: дедлайн в прошлом — сбор останавливается",
-          stopped28 is True and 0 < len(raw28) < 4000)
+    check("28 бюджет: дедлайн в прошлом — сбор мгновенно остановлен",
+          stopped28 is True and len(raw28) == 0 and len(segs28) == 0)
     ao.COLLECT_BUDGET_S = -1.0
     pts_g, segs_g, tr_g = ov28b._collect_group(
         [lyr_many], iface28b.canvas.extent(), dest28)
 finally:
     ao.COLLECT_BUDGET_S = saved_budget
 check("28 бюджет: _collect_group помечает усечение по времени",
-      tr_g is True and 0 < len(pts_g) < 4000 and 0 < len(segs_g) < 4000)
+      tr_g is True and len(pts_g) == 0 and len(segs_g) == 0)
 raw28b = []
 stopped28b = ov28b._collect_layer(lyr_many, iface28b.canvas.extent(),
                                   dest28, raw28b, [])
 check("28 бюджет: без дедлайна слой собирается целиком",
       stopped28b is False and len(raw28b) == 4000)
+
+# --- лимиты вершин/сегментов срабатывают ВНУТРИ одного огромного фича --
+huge_ring = [QgsPointXY(i * 0.001, (i % 7) * 0.001)
+             for i in range(na.MAX_RAW_POINTS + 10)]
+huge_ring.append(QgsPointXY(huge_ring[0].x(), huge_ring[0].y()))
+feat_huge = _AuditFeat(0, QgsGeometry.fromPolygonXY([huge_ring]))
+lyr_huge = _AuditLyr("A-huge", [feat_huge], editable=True)
+raw_h = []
+segs_h = []
+stopped_h = ov28b._collect_layer(lyr_huge, iface28b.canvas.extent(),
+                                 dest28, raw_h, segs_h, None)
+check("28 лимит: одна фича с >MAX_RAW_POINTS вершин усечена по лимиту",
+      stopped_h is True and len(raw_h) == na.MAX_RAW_POINTS)
 
 # ---------------------------------------------------------------------------
 # 29. Кнопка «Отменить» (v1.6.2). Штатная отмена QGIS привязана к
@@ -2190,6 +2213,9 @@ check("29 can_undo: слой вне правки -> False",
 
 # --- хук ядра: после успешной операции запомнен редактируемый слой -------
 class _UndoCrs(object):
+    def __eq__(self, other):
+        return isinstance(other, _UndoCrs) and self.authid() == other.authid()
+
     def authid(self):
         return "EPSG:4326"
 
@@ -2294,6 +2320,78 @@ rep5 = ed4.add_vertex_on_edge(pt(2, 0), pt(2, 2), pt(2, 1))
 check("29 хук: add_vertex_on_edge применился и запомнил слой",
       rep5["error"] is None and rep5["features"] >= 1 and
       ut.last_edited_layer() is ed_layer3)
+
+# ---------------------------------------------------------------------------
+# 30. Вливание кандидата-фикса (v1.6.3): translate_edge_vertices,
+#     откат всей правки при сбое записи, отмена при >MAX_OVERLAP_NEIGHBORS
+# ---------------------------------------------------------------------------
+
+# --- промежуточные коллинеарные вершины на общей границе -----------------
+polys_a = [[[QgsPointXY(0, 0), QgsPointXY(2, 0), QgsPointXY(4, 0),
+             QgsPointXY(4, 4), QgsPointXY(0, 4), QgsPointXY(0, 0)]]]
+anchors30 = [QgsPointXY(0, 0), QgsPointXY(4, 0)]
+new30, ch30 = gu.translate_edge_vertices(polys_a, anchors30, (1, 0),
+                                         gu.TOPO_MATCH_EPS2)
+xs30 = [p.x() for p in new30[0][0]]
+check("30 границы: промежуточная коллинеарная вершина двигается с ребром",
+      ch30 == 4 and xs30 == [1.0, 3.0, 5.0, 4.0, 0.0, 1.0])
+
+# вершина на той же прямой, но ЗА концом цепочки — не двигается
+polys_c = [[[QgsPointXY(8, 0), QgsPointXY(12, 0), QgsPointXY(12, 4),
+             QgsPointXY(8, 4), QgsPointXY(8, 0)]]]
+new_c, ch_c = gu.translate_edge_vertices(polys_c, anchors30, (1, 0),
+                                         gu.TOPO_MATCH_EPS2)
+check("30 границы: вершина вне цепочки (за её концом) не сдвигается",
+      ch_c == 0)
+
+# вершина НА линии цепочки, но без смежного ребра вдоль неё — не двигается
+polys_h = [[[QgsPointXY(-4, -4), QgsPointXY(4, -4), QgsPointXY(4, -8),
+             QgsPointXY(-4, -8), QgsPointXY(-4, -4)],
+            [QgsPointXY(1, 0), QgsPointXY(3, 1), QgsPointXY(5, 0),
+             QgsPointXY(1, 0)]]]
+new_h, ch_h = gu.translate_edge_vertices(polys_h, anchors30, (1, 0),
+                                         gu.TOPO_MATCH_EPS2)
+check("30 границы: вершина дыры на линии цепочки без ребра вдоль неё — не сдвигается",
+      ch_h == 0)
+
+# --- сбой записи одной фичи откатывает ВСЮ команду -----------------------
+class _FailEditLyr(_UndoEditLyr):
+    """changeGeometry возвращает False для заданной фичи."""
+
+    def __init__(self, feats, fail_fid):
+        _UndoEditLyr.__init__(self, feats)
+        self._fail_fid = fail_fid
+        self.destroyed = 0
+
+    def changeGeometry(self, fid, g):
+        if fid == self._fail_fid:
+            return False
+        return _UndoEditLyr.changeGeometry(self, fid, g)
+
+    def destroyEditCommand(self):
+        self.commands.append(("destroy", None))
+        self.destroyed += 1
+
+
+fail_lyr = _FailEditLyr([feat_a, feat_b], fail_fid=2)
+ut.note_edited_layer(None)
+ed5 = te.TopoEditor(None, fail_lyr)
+rep_f = ed5.move_vertex(pt(2, 2), pt(3, 3))
+check("30 откат: сбой записи фичи отменяет всю команду целиком",
+      rep_f["error"] is not None and rep_f["moved"] == 0 and
+      fail_lyr.destroyed >= 1)
+check("30 откат: после отката слой НЕ запоминается как последний правленый",
+      ut.last_edited_layer() is None)
+
+# --- соседей больше MAX_OVERLAP_NEIGHBORS — операция отменяется ---------
+fillers30 = [_UndoFeat(100 + i, QgsGeometry.fromPolygonXY(
+    [ring((20, 20), (22, 20), (22, 22), (20, 22))]))
+    for i in range(te.MAX_OVERLAP_NEIGHBORS + 1)]
+dense_lyr = _UndoEditLyr([feat_a, feat_b] + fillers30)
+ed6 = te.TopoEditor(None, dense_lyr)
+rep_d = ed6.move_vertex(pt(2, 2), pt(3, 3))
+check("30 соседи: больше MAX_OVERLAP_NEIGHBORS — операция отменена",
+      rep_d["error"] is not None and rep_d["moved"] == 0)
 
 # ---------------------------------------------------------------------------
 print("")

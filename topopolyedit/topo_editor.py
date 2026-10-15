@@ -23,7 +23,7 @@ from qgis.core import (
 
 from .geo_utils import (
     norm_polys, polys_to_geom, replace_vertices, insert_vertex_topo,
-    polys_bbox, points_bbox, contains_vertex, translate_vertices,
+    polys_bbox, points_bbox, contains_vertex, translate_edge_vertices,
     TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
 )
 from .snapping_engine import get_snap_layers
@@ -194,7 +194,7 @@ class TopoEditor(object):
                 continue  # свой слой — отдельный сценарий (по запросу)
             if lyr.geometryType() != QgsWkbTypes.PolygonGeometry:
                 continue  # отсекать можно только полигонами
-            same = lyr.crs().authid() == dest.authid()
+            same = lyr.crs() == dest
             ct = None
             if same:
                 rect = bbox
@@ -250,8 +250,8 @@ class TopoEditor(object):
                     continue
                 g2 = g.difference(ref)
             except Exception as exc:
-                utils.log(u"Отсечение: сбой difference — {}".format(exc))
-                continue
+                raise RuntimeError(
+                    u"Отсечение: сбой difference — {}".format(exc)) from exc
             if g2 is None or g2.isNull() or g2.isEmpty():
                 g = QgsGeometry()  # полигон полностью поглощён
                 break
@@ -261,9 +261,11 @@ class TopoEditor(object):
                     g3 = polygon_only(g2.makeValid())
                 except Exception as exc:
                     utils.log(u"Отсечение: сбой makeValid — {}".format(exc))
-            if g3 is not None:
-                g = g3
-                clipped += 1
+            if g3 is None or not g3.isGeosValid():
+                raise RuntimeError(
+                    u"Отсечение: результат не является корректным полигоном")
+            g = g3
+            clipped += 1
         return g, clipped
 
     def _push(self, text, level=Qgis.Info, duration=4):
@@ -294,11 +296,12 @@ class TopoEditor(object):
             if g.type() != QgsWkbTypes.PolygonGeometry:
                 continue
             out.append((feat.id(), g))
-            if len(out) >= MAX_OVERLAP_NEIGHBORS:
-                utils.log(u"Перехлёст: соседей слишком много (>{}), "
-                          u"проверена только часть".format(
-                              MAX_OVERLAP_NEIGHBORS))
-                break
+            if len(out) > MAX_OVERLAP_NEIGHBORS:
+                raise RuntimeError(
+                    u"Соседей в области больше {} — операция отменена, "
+                    u"чтобы не выполнить частичное отсечение; "
+                    u"уменьшите перемещаемый участок".format(
+                        MAX_OVERLAP_NEIGHBORS))
         return out
 
     def preview_overlaps(self, prepared, exclude_ids):
@@ -428,18 +431,18 @@ class TopoEditor(object):
         refs, truncated = self._clip_references(bbox)
         report["refs"] = len(refs)
         if truncated:
-            self._push(u"Эталонов для отсечения слишком много "
-                       u"(>{}), часть перехлестов могла остаться. "
-                       u"Уменьшите экстент.".format(MAX_CLIP_REFS),
-                       level=Qgis.Warning, duration=6)
+            report["error"] = (
+                u"Эталонов для отсечения слишком много (>{}) — "
+                u"уменьшите экстент или список слоёв".format(MAX_CLIP_REFS))
+            return report
 
         # --- 1. новые геометрии (запись ещё не началась) -----------------
         prepared = []  # [(entry, geometry, clipped_count)]
         for e in entries:
             g = polys_to_geom(e["polys"], e["multi"])
             if g.isNull() or g.isEmpty():
-                report["skipped"] += 1
-                continue
+                report["error"] = u"Перемещаемый полигон без геометрии"
+                return report
             if not g.isGeosValid():
                 try:
                     gv = g.makeValid()
@@ -447,16 +450,34 @@ class TopoEditor(object):
                             and gv.type() == QgsWkbTypes.PolygonGeometry:
                         g = gv
                 except Exception as exc:
-                    utils.log(u"Запись: сбой makeValid фичи #{} — {}"
-                              .format(e["fid"], exc))
+                    report["error"] = u"Некорректная геометрия #{}: {}".format(
+                        e["fid"], exc)
+                    return report
+                if not g.isGeosValid():
+                    report["error"] = u"Некорректная геометрия #{}".format(
+                        e["fid"])
+                    return report
 
-            g, clipped_here = self._clip_against_refs(g, refs)
+            try:
+                g, clipped_here = self._clip_against_refs(g, refs)
+            except Exception as exc:
+                report["error"] = u"Отсечение #{}: сбой — {}".format(
+                    e["fid"], exc)
+                return report
 
             if g.isNull() or g.isEmpty():
-                # полигон полностью поглощён соседями — не меняем
-                report["skipped"] += 1
-                continue
-            prepared.append((e, g, clipped_here))
+                report["error"] = (
+                    u"Отсечение полностью поглотило полигон #{} — "
+                    u"операция отменена".format(e["fid"]))
+                return report
+            fitted = self._fit_to_layer(g)
+            if fitted is None:
+                report["error"] = (
+                    u"Отсечение полигона #{} дало мультиполигон, слой не "
+                    u"допускает мультигеометрию — операция отменена".format(
+                        e["fid"]))
+                return report
+            prepared.append((e, fitted, clipped_here))
 
         # --- 2. перехлёст с объектами того же слоя ----------------------
         overlaps = []
@@ -482,62 +503,72 @@ class TopoEditor(object):
             by_neighbor.setdefault(o["neighbor"], []).append(o["moved"])
         neighbor_geom = dict(neighbors)
 
-        # --- 3. запись одной командой -----------------------------------
-        self.layer.beginEditCommand(command_text)
-        final = {}  # fid -> записанная геометрия перемещаемого полигона
-        for e, g, clipped_here in prepared:
-            if choice == CHOICE_CLIP_MOVED and e["fid"] in by_moved:
-                g, more = self._clip_against_refs(
-                    g, [neighbor_geom[n] for n in by_moved[e["fid"]]])
-                clipped_here += more
-                if g.isNull() or g.isEmpty():
-                    report["skipped"] += 1  # поглощён соседями — не меняем
-                    continue
-            if self.layer.changeGeometry(e["fid"], g):
+        # Вся правка одной командой: частичная запись или оставшийся
+        # после сбоя перехлёст недопустимы — при ошибке откатывается всё.
+        command_started = False
+        try:
+            self.layer.beginEditCommand(command_text)
+            command_started = True
+            final = {}
+            for e, g, clipped_here in prepared:
+                if choice == CHOICE_CLIP_MOVED and e["fid"] in by_moved:
+                    g, more = self._clip_against_refs(
+                        g, [neighbor_geom[n] for n in by_moved[e["fid"]]])
+                    clipped_here += more
+                    if g.isNull() or g.isEmpty():
+                        raise RuntimeError(
+                            u"Отсечение полностью поглотило полигон #{}".format(
+                                e["fid"]))
+                fitted = self._fit_to_layer(g)
+                if fitted is None or not fitted.isGeosValid():
+                    raise RuntimeError(
+                        u"Неподдерживаемая или некорректная геометрия "
+                        u"полигона #{}".format(e["fid"]))
+                if not self.layer.changeGeometry(e["fid"], fitted):
+                    raise RuntimeError(
+                        u"Не удалось записать геометрию #{} (changeGeometry)"
+                        .format(e["fid"]))
                 report["moved"] += 1
                 report["clipped"] += clipped_here
-                final[e["fid"]] = g
-            else:
-                report["skipped"] += 1
+                final[e["fid"]] = fitted
 
-        if choice == CHOICE_CLIP_NEIGHBORS:
-            for nfid, mfids in by_neighbor.items():
-                ng = neighbor_geom[nfid]
-                cut = False
-                for mfid in mfids:
-                    if mfid not in final:
-                        continue  # перемещаемый не записан — соседа не режем
-                    cut = True
-                    try:
+            if choice == CHOICE_CLIP_NEIGHBORS:
+                for nfid, mfids in by_neighbor.items():
+                    ng = neighbor_geom[nfid]
+                    cut = False
+                    for mfid in mfids:
+                        if mfid not in final:
+                            continue
+                        cut = True
                         ng = polygon_only(ng.difference(final[mfid]))
-                    except Exception as exc:
-                        utils.log(u"Обрезка соседа #{}: сбой difference — {}"
-                                  .format(nfid, exc))
-                        ng = None
-                    if ng is None:
-                        break
-                if not cut:
-                    continue
-                if ng is None:
-                    # сосед поглощён целиком (или сбой) — не удаляем и не
-                    # меняем его: решение за пользователем
-                    report["skipped"] += 1
-                    continue
-                fitted = self._fit_to_layer(ng)
-                if fitted is None:
-                    report["skipped"] += 1
-                    utils.log(u"Обрезка соседа #{}: результат распался на "
-                              u"части, слой не допускает мультиполигоны — "
-                              u"сосед не изменён".format(nfid))
-                    continue
-                if self.layer.changeGeometry(nfid, fitted):
+                        if ng is None:
+                            raise RuntimeError(
+                                u"Отсечение полностью поглотило соседа #{}"
+                                .format(nfid))
+                    if not cut:
+                        continue
+                    fitted = self._fit_to_layer(ng)
+                    if fitted is None or not fitted.isGeosValid():
+                        raise RuntimeError(
+                            u"Неподдерживаемая или некорректная геометрия "
+                            u"соседа #{}".format(nfid))
+                    if not self.layer.changeGeometry(nfid, fitted):
+                        raise RuntimeError(
+                            u"Не удалось записать геометрию соседа #{} "
+                            u"(changeGeometry)".format(nfid))
                     report["neighbors_clipped"] += 1
-                else:
-                    report["skipped"] += 1
-        self.layer.endEditCommand()
-        # слой запоминается для кнопки «Отменить» (штатная отмена QGIS
-        # привязана к активному слою и может быть недоступна)
-        utils.note_edited_layer(self.layer)
+            self.layer.endEditCommand()
+            command_started = False
+            # слой запоминается для кнопки «Отменить» (штатная отмена QGIS
+            # привязана к активному слою и может быть недоступна)
+            utils.note_edited_layer(self.layer)
+        except Exception as exc:
+            if command_started:
+                self.layer.destroyEditCommand()
+            report.update({"moved": 0, "clipped": 0,
+                           "neighbors_clipped": 0,
+                           "error": str(exc)})
+            return report
         self.layer.triggerRepaint()
         return report
 
@@ -608,8 +639,8 @@ class TopoEditor(object):
             if not nr:
                 continue
             polys, was_multi = nr
-            new_polys, changed = translate_vertices(polys, anchors, delta,
-                                                    eps2)
+            new_polys, changed = translate_edge_vertices(
+                polys, anchors, delta, eps2)
             if changed:
                 entries.append({"fid": feat.id(), "polys": new_polys,
                                 "multi": was_multi})
@@ -705,8 +736,11 @@ class TopoEditor(object):
             self.layer.beginEditCommand(u"Вставка узла на ребро")
             for t in targets:
                 g = polys_to_geom(t["polys"], t["multi"])
-                if self.layer.changeGeometry(t["fid"], g):
-                    report["features"] += 1
+                if not self.layer.changeGeometry(t["fid"], g):
+                    raise RuntimeError(
+                        u"Не удалось записать геометрию #{} (changeGeometry)"
+                        .format(t["fid"]))
+                report["features"] += 1
             self.layer.endEditCommand()
             utils.note_edited_layer(self.layer)  # для кнопки «Отменить»
             self.layer.triggerRepaint()
@@ -715,5 +749,7 @@ class TopoEditor(object):
                 self.layer.destroyEditCommand()
             except Exception:
                 pass
+            report["inserted"] = 0
+            report["features"] = 0
             report["error"] = str(exc)
         return report

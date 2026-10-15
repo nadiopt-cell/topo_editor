@@ -25,7 +25,7 @@ from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
                        Qgis, QgsFeatureRequest)
 
 from .geo_utils import (norm_polys, polys_to_geom, collinear_run,
-                        translate_vertices, find_segment, contains_vertex,
+                        translate_edge_vertices, find_segment, contains_vertex,
                         points_bbox, TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
                         COLLINEAR_EPS2)
 from .snapping_engine import get_snap_layers
@@ -354,8 +354,8 @@ class TopoEdgeMoveTool(BaseTopoTool):
         match2 = drag["match_eps"] * drag["match_eps"]
         prepared = []  # [(fid, геометрия в CRS слоя)] — для красной области
         for rb, en in zip(self.rubbers, drag["entries"]):
-            new_polys, _ch = translate_vertices(en["polys"], drag["anchors"],
-                                                delta_l, match2)
+            new_polys, _ch = translate_edge_vertices(
+                en["polys"], drag["anchors"], delta_l, match2)
             g = polys_to_geom(new_polys, en["multi"])
             prepared.append((en["fid"], QgsGeometry(g)))
             try:

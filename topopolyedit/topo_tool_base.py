@@ -57,6 +57,7 @@ class BaseTopoTool(QgsMapTool):
         self.engine = SnappingEngine(iface.mapCanvas())
         self.drag = None
         self.rubbers = []
+        self._rubber_pool = []
 
         # маркер точки прилипания (фиолетовый круг)
         self.snap_marker = QgsVertexMarker(self.canvas())
@@ -147,16 +148,21 @@ class BaseTopoTool(QgsMapTool):
             pass
 
     def _make_polygon_rubber(self):
-        """Оранжевая резиновая лента одного перемещаемого полигона."""
-        rb = QgsRubberBand(self.canvas(), QgsWkbTypes.PolygonGeometry)
-        rb.setStrokeColor(QColor(230, 120, 0))
-        rb.setFillColor(QColor(255, 170, 0, 90))
-        rb.setWidth(2)
+        """Лента перемещаемого полигона — переиспользуется из пула."""
+        index = len(self.rubbers)
+        if index < len(self._rubber_pool):
+            rb = self._rubber_pool[index]
+        else:
+            rb = QgsRubberBand(self.canvas(), QgsWkbTypes.PolygonGeometry)
+            rb.setStrokeColor(QColor(230, 120, 0))
+            rb.setFillColor(QColor(255, 170, 0, 90))
+            rb.setWidth(2)
+            self._rubber_pool.append(rb)
         self.rubbers.append(rb)
         return rb
 
     def _reset_poly_rubbers(self):
-        """Сброс всех лент перемещаемых полигонов."""
+        """Сброс активных лент (пул сохраняется для переиспользования)."""
         for rb in self.rubbers:
             try:
                 rb.reset(QgsWkbTypes.PolygonGeometry)

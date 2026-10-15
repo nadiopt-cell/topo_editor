@@ -283,7 +283,7 @@ class NodeAuditOverlay(object):
         :return: True — остановлено по бюджету времени (картинка неполная)
         """
         stopped = False
-        same = lyr.crs().authid() == dest_crs.authid()
+        same = lyr.crs() == dest_crs
         ct = None
         rect_l = extent_map
         if not same:
@@ -299,9 +299,14 @@ class NodeAuditOverlay(object):
         for feat in lyr.getFeatures(req):
             cnt += 1
             if cnt > MAX_FEATURES:
+                stopped = True
                 break
             if (deadline is not None and cnt % _DEADLINE_EVERY == 0
                     and time.monotonic() > deadline):
+                stopped = True
+                break
+            if (len(pts_out) >= na.MAX_RAW_POINTS or
+                    len(segs_out) >= na.MAX_SEGS):
                 stopped = True
                 break
             g = feat.geometry()
@@ -322,16 +327,36 @@ class NodeAuditOverlay(object):
                             verts = ring[:-1]
                         else:
                             verts = ring
-                        for v in verts:
+                        for vi, v in enumerate(verts):
+                            if (len(pts_out) >= na.MAX_RAW_POINTS or
+                                    (deadline is not None and
+                                     vi % _DEADLINE_EVERY == 0 and
+                                     time.monotonic() > deadline)):
+                                return True
                             pts_out.append((v.x(), v.y()))
-                        for _si, a, b in iter_ring_segments(ring):
+                        for si, a, b in iter_ring_segments(ring):
+                            if (len(segs_out) >= na.MAX_SEGS or
+                                    (deadline is not None and
+                                     si % _DEADLINE_EVERY == 0 and
+                                     time.monotonic() > deadline)):
+                                return True
                             segs_out.append(((a.x(), a.y()),
                                              (b.x(), b.y())))
             elif gtype == QgsWkbTypes.LineGeometry:
                 for line in iter_polyline_parts(g):
-                    for v in line:
+                    for vi, v in enumerate(line):
+                        if (len(pts_out) >= na.MAX_RAW_POINTS or
+                                (deadline is not None and
+                                 vi % _DEADLINE_EVERY == 0 and
+                                 time.monotonic() > deadline)):
+                            return True
                         pts_out.append((v.x(), v.y()))
                     for i in range(len(line) - 1):
+                        if (len(segs_out) >= na.MAX_SEGS or
+                                (deadline is not None and
+                                 i % _DEADLINE_EVERY == 0 and
+                                 time.monotonic() > deadline)):
+                            return True
                         a, b = line[i], line[i + 1]
                         segs_out.append(((a.x(), a.y()), (b.x(), b.y())))
             else:  # точечные слои: узлы = сами точки
@@ -340,7 +365,12 @@ class NodeAuditOverlay(object):
                 else:
                     p = g.asPoint()
                     pp = [p] if p is not None else []
-                for v in pp:
+                for vi, v in enumerate(pp):
+                    if (len(pts_out) >= na.MAX_RAW_POINTS or
+                            (deadline is not None and
+                             vi % _DEADLINE_EVERY == 0 and
+                             time.monotonic() > deadline)):
+                        return True
                     pts_out.append((v.x(), v.y()))
         return stopped
 
