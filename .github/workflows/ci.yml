@@ -33,7 +33,7 @@ jobs:
       - name: Тесты на настоящем QGIS
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python3 -m pytest tests/qgis -v --tb=short
+        run: python3 -m pytest tests/qgis -v --tb=short -rP
 
       - name: Компиляция всех модулей плагина
         run: |
