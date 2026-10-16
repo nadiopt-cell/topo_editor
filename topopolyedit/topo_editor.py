@@ -35,6 +35,7 @@ from .snapping_engine import get_snap_layers
 from . import topology_index as tindex
 from . import settings
 from . import utils
+from . import operation_log as oplog
 
 MAX_CLIP_REFS = 5000  # предохранитель на число эталонных полигонов
 # Лимит соседей того же слоя для проверки перехлёста (этап 3 ТЗ, п. 7:
@@ -160,7 +161,7 @@ class TopoEditor(object):
     """Исполнитель топологических операций над редактируемым слоем."""
 
     def __init__(self, iface, layer, overlap_decider=None,
-                 makevalid_decider=None):
+                 makevalid_decider=None, clip_decider=None):
         """
         :param iface: QgisInterface
         :param layer: редактируемый ПОЛИГОНАЛЬНЫЙ слой (в режиме правки)
@@ -174,11 +175,16 @@ class TopoEditor(object):
             невалидной геометрии, если в настройках включено «предлагать
             исправить через makeValid» (по умолчанию выключено). info =
             {"fid", "area_before"}. True — применить makeValid и продолжить.
+        :param clip_decider: callable(info) -> CLIP_CHOICE_*; вызывается
+            при перехлёсте со слоем вне правки, у которого в настройках
+            (этап 4, п. 7) выбран режим «спрашивать». info = {"area",
+            "count"}. Без decider перехлёст обрезается (как до этапа 4).
         """
         self.iface = iface
         self.layer = layer
         self.overlap_decider = overlap_decider
         self.makevalid_decider = makevalid_decider
+        self.clip_decider = clip_decider
 
     # ------------------------------------------------------------------
     # Индекс топологии (этап 3 ТЗ)
@@ -297,7 +303,7 @@ class TopoEditor(object):
                                 "multi": was_multi})
         return entries
 
-    def _clip_references(self, bbox):
+    def _clip_references(self, bbox, moving_layer_ids=None):
         """Эталонные полигоны ДРУГИХ слоёв для автоотсечения перехлестов.
 
         Берутся все включенные слои, кроме редактируемого: перехлёст с
@@ -306,14 +312,36 @@ class TopoEditor(object):
         зависит от того, снят ли этот слой в настройках прилипания.
         Геометрии приводятся к CRS редактируемого слоя. Слои только
         читаются — ничего в них не изменяется.
+
+        Этап 4 ТЗ:
+          * слои-участники операции (moving_layer_ids — их геометрии
+            двигаются ЭТОЙ ЖЕ операцией) НЕ являются эталонами: обе
+            стороны двигаются синхронно, отсечение по их СТАРОМУ
+            положению разрушило бы совмещённые границы;
+          * per-layer настройка (п. 7): «отсекать» — эталон, как раньше;
+            «не трогать» — слой пропускается; «спрашивать» — геометрии
+            возвращаются отдельно (ask_refs): при перехлёсте с ними
+            спрашивается пользователь (см. _apply_moves);
+
+        :return: (refs, truncated, ask_refs)
         """
         refs = []
+        ask_refs = []
+        moving = set(moving_layer_ids or ())
         dest = self.layer.crs()
         for lyr in get_snap_layers(self.layer):
             if lyr.id() == self.layer.id():
                 continue  # свой слой — отдельный сценарий (по запросу)
+            if lyr.id() in moving:
+                continue  # участник операции — двигается вместе (этап 4)
             if lyr.geometryType() != QgsWkbTypes.PolygonGeometry:
                 continue  # отсекать можно только полигонами
+            try:
+                mode = settings.clip_mode_for(lyr.id())
+            except Exception:
+                mode = settings.CLIP_CLIP
+            if mode == settings.CLIP_IGNORE:
+                continue  # «не трогать»: слой вне отсечения (этап 4, п. 7)
             same = lyr.crs() == dest
             ct = None
             if same:
@@ -344,14 +372,17 @@ class TopoEditor(object):
                                       u"CRS — пропущен ({})"
                                       .format(lyr.name(), feat.id(), exc))
                             continue
-                    refs.append(g)
+                    if mode == settings.CLIP_ASK:
+                        ask_refs.append((g, lyr.name()))
+                    else:
+                        refs.append(g)
                     if len(refs) >= MAX_CLIP_REFS:
-                        return refs, True
+                        return refs, True, ask_refs
             except Exception as exc:
                 utils.log(u"Слой «{}»: сбой чтения эталонов — {}"
                           .format(lyr.name(), exc))
                 continue
-        return refs, False
+        return refs, False, ask_refs
 
     @staticmethod
     def _clip_against_refs(g, refs):
@@ -593,12 +624,32 @@ class TopoEditor(object):
         return None
 
     # ------------------------------------------------------------------
-    # Общий конвейер перемещения
+    # Общий конвейер перемещения (этапы 1–2 ТЗ; многослойная запись —
+    # этап 4: план и запись разделены, см. _plan_moves / _write_plan)
     # ------------------------------------------------------------------
 
     def _apply_moves(self, entries, exclude_ids, command_text, eps,
-                     t_points=None):
-        """Конвейер перемещения: план → валидация → запись (этапы 1–2 ТЗ).
+                     t_points=None, moving_layer_ids=None):
+        """Полный конвейер одного слоя: план → валидация → запись.
+
+        Однослойный путь (совместимость): _plan_moves + _write_plan.
+        Многослойные операции (этап 4) используют планы напрямую:
+        все слои сначала дают планы (валидация ДО любых записей),
+        затем единый коммиттер пишет их атомарно.
+
+        :return: отчёт (см. _plan_moves)
+        """
+        report, plan = self._plan_moves(entries, exclude_ids, eps,
+                                        t_points=t_points,
+                                        moving_layer_ids=moving_layer_ids)
+        if plan is None:
+            return report
+        return self._write_plan(plan, command_text, report)
+
+    def _plan_moves(self, entries, exclude_ids, eps, t_points=None,
+                    moving_layer_ids=None):
+        """Шаги 1–4 конвейера перемещения: план БЕЗ записи (этапы 1–2 ТЗ;
+        разделение ради этапа 4 — атомарная запись нескольких слоёв).
 
         Общий конвейер операций перемещения (узла и ребра):
           1. новые геометрии: автоотсечение по эталонам ДРУГИХ слоёв
@@ -614,21 +665,24 @@ class TopoEditor(object):
              прилипший к ребру своего слоя, получает в этом ребре
              вершину — в той же операции;
           4. валидация плана (все правила этапов 1–2 по ВСЕМ затронутым
-             полигонам) — при ошибке слой вообще не трогается;
-          5. запись: changeGeometry в одной команде отмены (Ctrl+Z).
+             полигонам) — при ошибке слой вообще не трогается.
+
+        Запись — отдельный шаг _write_plan (шаг 5); для нескольких
+        слоёв коммиттер (этап 4, п. 3) открывает команды на ВСЕХ
+        затронутых слоях и уничтожает их ВСЕ при любой неудаче.
 
         :param entries: [{"fid", "polys", "multi"}, ...] — новые геометрии
         :param exclude_ids: {fid, ...} — перемещаемые фичи (не эталоны)
-        :param command_text: название edit-команды (видно в истории отмены)
         :param eps: допуск (единицы CRS слоя) — запас габарита
         :param t_points: [QgsPointXY, ...] новые позиции перемещённых
                          узлов/якорей — для T-залатывания (этап 2) и
                          правила NoTJunction
-        :return: {"moved", "clipped", "skipped", "refs", "overlaps",
-                  "neighbors_clipped", "overlap_choice", "cancelled",
-                  "t_inserted", "violations" (dict-список или None),
-                  "warnings" (dict-список предупреждений или None),
-                  "makevalid_repaired"}
+        :param moving_layer_ids: [layer_id, ...] — слои, чьи геометрии
+                         двигаются ЭТОЙ ЖЕ операцией (этап 4): они не
+                         являются эталонами отсечения
+        :return: (report, plan) — plan None при ошибке/отмене; план
+                 содержит {"final", "write_order", "prepared",
+                 "final_clipped", "t_fids", "old_geoms", "eps", "bbox"}
         """
         report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0,
                   "overlaps": 0, "neighbors_clipped": 0,
@@ -647,20 +701,24 @@ class TopoEditor(object):
             else:
                 bbox.combineExtentWith(r)
         if bbox is None:
-            return report  # пустой список — нечего двигать и отсекать
+            return report, None  # пустой список — нечего двигать и отсекать
         # запас поиска эталонов: match_eps слишком мал; берём долю bbox
         w = max(bbox.width(), 0.0)
         h = max(bbox.height(), 0.0)
         pad = max(eps * 10.0, (w + h) * 0.001, 1e-6)
         bbox.grow(pad)
 
-        refs, truncated = self._clip_references(bbox)
+        moving_ids = set(moving_layer_ids or ())
+        moving_ids.add(self.layer.id())
+        refs, truncated, ask_refs = self._clip_references(
+            bbox, moving_layer_ids=moving_ids)
         report["refs"] = len(refs)
+        report["ask_refs"] = len(ask_refs)
         if truncated:
             report["error"] = (
                 u"Эталонов для отсечения слишком много (>{}) — "
                 u"уменьшите экстент или список слоёв".format(MAX_CLIP_REFS))
-            return report
+            return report, None
 
         # --- 1. новые геометрии (запись ещё не началась) -----------------
         prepared = []  # [(entry, geometry, clipped_count)]
@@ -715,6 +773,73 @@ class TopoEditor(object):
                 report["violations"] = [v.to_dict() for v in violations]
                 return report
             prepared.append((e, fitted, clipped_here))
+
+        # --- 1б. перехлёст со слоями «спрашивать» (этап 4, п. 7) --------
+        # Слои вне правки с per-layer настройкой «спрашивать»: при наличии
+        # перехлёста запрашивается решение (clip_decider); без decider —
+        # обрезка (поведение до этапа 4). «Не трогать» отсеяно ещё в
+        # _clip_references, «отсекать» — обычные эталоны refs.
+        if ask_refs and prepared:
+            pairs = [(e["fid"], g) for e, g, _c in prepared]
+            ask_pairs = [(i, g) for i, (g, _n) in enumerate(ask_refs)]
+            try:
+                ask_overlaps = find_overlaps(pairs, ask_pairs)
+            except Exception as exc:
+                ask_overlaps = []
+                utils.log(u"Спрашивать-эталоны: сбой проверки — {}"
+                          .format(exc))
+            if ask_overlaps:
+                info = {"area": sum(o["area"] for o in ask_overlaps),
+                        "count": len(ask_overlaps),
+                        "layer_names": sorted(
+                            {n for _g, n in ask_refs})}
+                decision = settings.CLIP_CHOICE_CLIP
+                if self.clip_decider is not None:
+                    try:
+                        decision = self.clip_decider(info) \
+                            or settings.CLIP_CHOICE_CLIP
+                    except Exception as exc:
+                        utils.log(u"Спрашивать-эталоны: сбой запроса — {}"
+                                  .format(exc))
+                        decision = settings.CLIP_CHOICE_CLIP
+                if decision not in (settings.CLIP_CHOICE_CLIP,
+                                    settings.CLIP_CHOICE_KEEP,
+                                    settings.CLIP_CHOICE_CANCEL):
+                    decision = settings.CLIP_CHOICE_CLIP
+                if decision == settings.CLIP_CHOICE_KEEP:
+                    pass  # оставить перехлёст — не отсекаем
+                elif decision == settings.CLIP_CHOICE_CANCEL:
+                    report["cancelled"] = True
+                    return report
+                else:
+                    # «отсекать»: обрезаем перемещаемые по ask-эталонам
+                    ask_geoms = [g for g, _n in ask_refs]
+                    new_prepared = []
+                    for e, g, clipped_here in prepared:
+                        try:
+                            g2, more = self._clip_against_refs(g, ask_geoms)
+                        except Exception as exc:
+                            report["error"] = (
+                                u"Отсечение по слою «спрашивать» #{}: "
+                                u"сбой — {}".format(e["fid"], exc))
+                            return report
+                        if g2.isNull() or g2.isEmpty():
+                            report["error"] = (
+                                u"Отсечение по слою «спрашивать» полностью "
+                                u"поглотило полигон #{} — операция отменена"
+                                .format(e["fid"]))
+                            return report
+                        fitted = self._fit_to_layer(g2)
+                        if fitted is None:
+                            report["error"] = (
+                                u"Полигон #{} после отсечения состоит из "
+                                u"нескольких частей, а слой объявлен с "
+                                u"типом «одиночный полигон»"
+                                .format(e["fid"]))
+                            return report
+                        new_prepared.append(
+                            (e, fitted, clipped_here + more))
+                    prepared = new_prepared
 
         # --- 2. перехлёст с объектами того же слоя ----------------------
         overlaps = []
@@ -865,15 +990,39 @@ class TopoEditor(object):
             utils.log(u"Валидатор: предупреждения — {}".format(
                 u"; ".join(v.message for v in warnings[:5])))
 
-        # --- 5. запись одной командой отмены (Ctrl+Z) --------------------
+        # --- 5. ПЛАН ГОТОВ: запись — отдельный шаг _write_plan ----------
+        # (разделение ради этапа 4: многослойная операция сначала
+        # собирает планы ВСЕХ слоёв и только потом пишет их атомарно)
+        write_order = [e["fid"] for e, _g, _c in prepared]
+        write_order += [f for f in sorted(final.keys())
+                        if f not in final_clipped]
+        plan = {"final": final, "write_order": write_order,
+                "final_clipped": final_clipped, "t_fids": t_fids,
+                "old_geoms": old_geoms, "eps": eps, "bbox": bbox}
+        return report, plan
+
+    def _write_plan(self, plan, command_text, report):
+        """Шаг 5: запись плана одной командой отмены (Ctrl+Z).
+
+        Однослойный путь. Многослойные операции (этап 4) пишут планы
+        нескольких слоёв через MultiLayerCommitter (multi_editor.py) —
+        командные блоки там согласованы с транзакционными группами.
+
+        :param plan: план из _plan_moves
+        :param command_text: название edit-команды (в истории отмены)
+        :param report: отчёт _plan_moves (дополняется счётчиками)
+        :return: report
+        """
+        final = plan["final"]
+        final_clipped = plan["final_clipped"]
+        t_fids = plan["t_fids"]
+        old_geoms = plan["old_geoms"]
+        eps = plan["eps"]
         command_started = False
         try:
             self.layer.beginEditCommand(command_text)
             command_started = True
-            write_order = [e["fid"] for e, _g, _c in prepared]
-            write_order += [f for f in sorted(final.keys())
-                            if f not in final_clipped]
-            for fid in write_order:
+            for fid in plan["write_order"]:
                 if not self.layer.changeGeometry(fid, final[fid]):
                     raise RuntimeError(
                         u"Не удалось записать геометрию #{} (changeGeometry)"
@@ -890,6 +1039,16 @@ class TopoEditor(object):
             # слой запоминается для кнопки «Отменить» (штатная отмена QGIS
             # привязана к активному слою и может быть недоступна)
             utils.note_edited_layer(self.layer)
+            # журнал операций плагина (этап 4, п. 4): однослойная операция
+            # регистрируется так же, как многослойные, — кнопка «Отменить»
+            # работает по одному и тому же журналу
+            try:
+                oplog.note_operation(
+                    [(self.layer.id(), command_text,
+                      self.layer.undoStack().index())],
+                    transaction_group=False)
+            except Exception:
+                pass
             # журнал габарита операции для afterRollBack индекса (этап 3,
             # п. 3): НОВЫЕ и СТАРЫЕ положения затронутых фич + запас
             try:

@@ -14,7 +14,7 @@
     прилипания подсвечиваются;
   * перехлёсты с полигонами других слоёв отсекаются автоматически, а с
     объектами ЭТОГО ЖЕ слоя — по запросу пользователя (красная область в
-    превью, диалог при отпускании; TopoEditor.move_edge);
+    превью, диалог при отпускании; MultiLayerEditor.move_edge — этап 4);
   * Esc — отмена перетаскивания / выход из инструмента.
 """
 
@@ -32,7 +32,7 @@ from .geo_utils import (norm_polys, polys_to_geom, collinear_run,
                         TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
                         COLLINEAR_EPS2)
 from .snapping_engine import get_snap_layers
-from .topo_editor import TopoEditor
+from .multi_editor import MultiLayerEditor
 from .topo_tool_base import BaseTopoTool
 from .topo_move_tool import _snap_note
 from . import settings
@@ -412,11 +412,18 @@ class TopoEdgeMoveTool(BaseTopoTool):
             if delta_l[0] * delta_l[0] + delta_l[1] * delta_l[1] <= 1e-12:
                 self._cleanup()
                 return
-            editor = TopoEditor(self.iface, drag["layer"], self._ask_overlap,
-                                self._ask_makevalid)
-            report = editor.move_edge(drag["anchors"], delta_l,
-                                      drag["match_eps"])
-            self._report(report, drag["ct_l2m"])
+            # этап 4: многослойный координатор; при режиме «только
+            # активный слой»/отсутствии общих якорей в других слоях
+            # ведёт себя как прежний однослойный путь
+            editor = MultiLayerEditor(
+                self.iface, drag["layer"], self._ask_overlap,
+                self._ask_makevalid, self._ask_clip)
+            report = editor.move_edge(
+                drag["anchors"], delta_l, drag["match_eps"],
+                ct_m2l=drag["ct_m2l"], ct_l2m=drag["ct_l2m"])
+            report["multi"] = True
+            ct = drag["ct_l2m"] if report.get("crs_uniform", True) else None
+            self._report(report, ct)
         except Exception as exc:
             self._push_error(exc)
         finally:

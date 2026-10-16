@@ -18,7 +18,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
     QListWidget, QListWidgetItem, QPushButton, QComboBox, QDoubleSpinBox,
-    QSpinBox, QDialogButtonBox, QCheckBox,
+    QSpinBox, QDialogButtonBox, QCheckBox, QRadioButton, QWidget,
 )
 from qgis.core import QgsProject, QgsWkbTypes, QgsVectorLayer
 
@@ -231,6 +231,56 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp_idx)
 
         # --------------------------------------------------------------
+        # Правка нескольких слоёв (этап 4 ТЗ)
+        # --------------------------------------------------------------
+        grp_multi = QGroupBox(u"Правка нескольких слоёв", self)
+        mx = QVBoxLayout(grp_multi)
+
+        self.rb_scope_all = QRadioButton(
+            u"Двигать ВСЕ слои в правке одной операцией (рекомендуется)",
+            grp_multi)
+        self.rb_scope_all.setToolTip(
+            u"Перемещение узла/ребра меняет все полигональные слои в\n"
+            u"режиме правки, у которых есть этот узел или ребро —\n"
+            u"одной атомарной операцией, с общей отменой. Слои между\n"
+            u"собой не рассинхронизируются.")
+        self.rb_scope_active = QRadioButton(
+            u"Только активный слой (поведение прежних версий)", grp_multi)
+        self.rb_scope_active.setToolTip(
+            u"Операция меняет только активный слой; остальные слои в\n"
+            u"правке остаются эталонами (их полигоны не двигаются).")
+        scope = settings.edit_scope()
+        if scope == settings.EDIT_SCOPE_ACTIVE:
+            self.rb_scope_active.setChecked(True)
+        else:
+            self.rb_scope_all.setChecked(True)
+        mx.addWidget(self.rb_scope_all)
+        mx.addWidget(self.rb_scope_active)
+
+        mx.addWidget(QLabel(
+            u"Слои, которые операции плагина НЕ двигают (правятся "
+            u"вручную):", grp_multi))
+        self.lst_edit_excl = QListWidget(grp_multi)
+        self.lst_edit_excl.setMaximumHeight(96)
+        self.lst_edit_excl.setToolTip(
+            u"Отмеченный слой исключается из многослойной операции: его\n"
+            u"полигоны остаются эталонами, а правятся только вручную.")
+        self._fill_edit_exclusions()
+        mx.addWidget(self.lst_edit_excl)
+
+        mx.addWidget(QLabel(
+            u"Отсечение перехлёстов по слоям ВНЕ правки:", grp_multi))
+        self.lst_clip_modes = QListWidget(grp_multi)
+        self.lst_clip_modes.setMaximumHeight(96)
+        self.lst_clip_modes.setToolTip(
+            u"«Отсекать» — перемещаемые полигоны обрезаются по объектам\n"
+            u"слоя автоматически (как раньше). «Спрашивать» — вопрос при\n"
+            u"перехлёсте. «Не трогать» — перехлёст остаётся.")
+        self._fill_clip_modes()
+        mx.addWidget(self.lst_clip_modes)
+        lay.addWidget(grp_multi)
+
+        # --------------------------------------------------------------
         # Кнопки
         # --------------------------------------------------------------
         row_btn = QHBoxLayout()
@@ -357,6 +407,95 @@ class SettingsDialog(QDialog):
             self.spn_vertex.value() < self.spn_edge.value())
 
     # ------------------------------------------------------------------
+    # Правка нескольких слоёв (этап 4)
+    # ------------------------------------------------------------------
+
+    def _polygon_layers(self):
+        """Полигональные слои проекта (для списков этапа 4)."""
+        out = []
+        try:
+            for lyr in QgsProject.instance().mapLayers().values():
+                if not isinstance(lyr, QgsVectorLayer) or not lyr.isValid():
+                    continue
+                if lyr.geometryType() != QgsWkbTypes.PolygonGeometry:
+                    continue
+                out.append(lyr)
+        except Exception:
+            pass
+        try:
+            out.sort(key=lambda l: l.name().lower())
+        except Exception:
+            pass
+        return out
+
+    def _fill_edit_exclusions(self):
+        """Чёрный список правки: слои, которые операции НЕ двигают."""
+        self.lst_edit_excl.clear()
+        disabled = settings.edit_disabled_ids()
+        for lyr in self._polygon_layers():
+            item = QListWidgetItem(lyr.name(), self.lst_edit_excl)
+            item.setData(Qt.ItemDataRole.UserRole, lyr.id())
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled |
+                          Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if lyr.id() in disabled
+                else Qt.CheckState.Unchecked)
+
+    def _fill_clip_modes(self):
+        """Per-layer режим отсечения: слой + комбобокс (этап 4, п. 7)."""
+        self.lst_clip_modes.clear()
+        labels = [
+            (u"отсекать", settings.CLIP_CLIP),
+            (u"спрашивать", settings.CLIP_ASK),
+            (u"не трогать", settings.CLIP_IGNORE),
+        ]
+        for lyr in self._polygon_layers():
+            item = QListWidgetItem(lyr.name(), self.lst_clip_modes)
+            item.setData(Qt.ItemDataRole.UserRole, lyr.id())
+            widget = QWidget(self.lst_clip_modes)
+            wlay = QHBoxLayout(widget)
+            wlay.setContentsMargins(4, 0, 4, 0)
+            wlay.addWidget(QLabel(lyr.name(), widget), 1)
+            combo = QComboBox(widget)
+            for label, data in labels:
+                combo.addItem(label, data)
+            cur = settings.clip_mode_for(lyr.id())
+            for i in range(combo.count()):
+                if combo.itemData(i) == cur:
+                    combo.setCurrentIndex(i)
+                    break
+            combo.currentIndexChanged.connect(self._clip_mode_changed)
+            wlay.addWidget(combo)
+            item.setSizeHint(widget.sizeHint())
+            self.lst_clip_modes.setItemWidget(item, widget)
+
+    def _clip_mode_changed(self, _idx):
+        """Сохраняет режим сразу при смене (слои — по id из item data)."""
+        lw = self.lst_clip_modes
+        for i in range(lw.count()):
+            item = lw.item(i)
+            widget = lw.itemWidget(item)
+            if widget is None:
+                continue
+            combo = widget.findChild(QComboBox)
+            if combo is None:
+                continue
+            mode = combo.currentData()
+            settings.set_clip_mode(str(item.data(Qt.ItemDataRole.UserRole)),
+                                   mode)
+
+    def _edit_exclusion_ids(self):
+        """id слоёв, отмеченных как исключённые из многослойной правки."""
+        out = []
+        for i in range(self.lst_edit_excl.count()):
+            item = self.lst_edit_excl.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                lid = item.data(Qt.ItemDataRole.UserRole)
+                if lid:
+                    out.append(str(lid))
+        return out
+
+    # ------------------------------------------------------------------
     # Применение
     # ------------------------------------------------------------------
 
@@ -371,6 +510,18 @@ class SettingsDialog(QDialog):
         self.chk_index.setChecked(settings.DEFAULT_INDEX_ON)
         self.spn_neighbors.setValue(settings.DEFAULT_MAX_NEIGHBORS)
         self.spn_tile.setValue(settings.DEFAULT_TILE_FACTOR)
+        # этап 4: все слои в правке, без исключений, отсечение — как раньше
+        self.rb_scope_all.setChecked(True)
+        for i in range(self.lst_edit_excl.count()):
+            self.lst_edit_excl.item(i).setCheckState(
+                Qt.CheckState.Unchecked)
+        for i in range(self.lst_clip_modes.count()):
+            widget = self.lst_clip_modes.itemWidget(
+                self.lst_clip_modes.item(i))
+            if widget is not None:
+                combo = widget.findChild(QComboBox)
+                if combo is not None:
+                    combo.setCurrentIndex(0)  # «отсекать»
 
     def current_config(self):
         """Текущее состояние диалога в виде конфига settings.save_settings."""
@@ -395,7 +546,14 @@ class SettingsDialog(QDialog):
 
     def apply(self):
         """Сохраняет настройки; движок подхватит их при следующем снэпе."""
-        return settings.save_settings(self.current_config())
+        ok = settings.save_settings(self.current_config())
+        # этап 4: область правки, исключения и per-layer режимы отсечения
+        settings.set_edit_scope(
+            settings.EDIT_SCOPE_ACTIVE if self.rb_scope_active.isChecked()
+            else settings.EDIT_SCOPE_ALL)
+        settings.set_edit_disabled(self._edit_exclusion_ids())
+        self._clip_mode_changed(0)
+        return ok
 
     def accept(self):
         self.apply()

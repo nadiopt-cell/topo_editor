@@ -38,14 +38,44 @@ KEY_SEAM_RATIO = SNAP_SECTION + "/seam_min_ratio"
 KEY_SHARED_SEVERITY = SNAP_SECTION + "/shared_boundary_severity"
 KEY_OFFER_MAKEVALID = SNAP_SECTION + "/offer_makevalid"
 KEY_EDGE_SLIDE = SNAP_SECTION + "/edge_slide_on_neighbors"
+
+# топологический допуск — константа geo_utils (без импорта модуля,
+# чтобы избежать циклической зависимости: geo_utils не знает о settings)
+TOPO_MATCH_EPS_CONST = 1e-6
 # индекс топологии (этап 3 ТЗ)
 KEY_INDEX_ON = SNAP_SECTION + "/topology_index_on"
 KEY_MAX_NEIGHBORS = SNAP_SECTION + "/max_overlap_neighbors"
 KEY_TILE_FACTOR = SNAP_SECTION + "/index_tile_factor"
+# правка нескольких слоёв одной операцией (этап 4 ТЗ)
+KEY_EDIT_SCOPE = SNAP_SECTION + "/edit_scope"
+KEY_EDIT_DISABLED = SNAP_SECTION + "/edit_disabled_layers"
+KEY_CLIP_MODES = SNAP_SECTION + "/clip_layer_modes"
 
 # Единицы допуска
 UNITS_PX = "px"      # пиксели экрана
 UNITS_MAP = "map"    # единицы CRS карты
+
+# Область правки (этап 4 ТЗ, п. 1): какие слои участвуют в операции
+EDIT_SCOPE_ALL = "all_editing"      # все слои в режиме правки (по умолчанию)
+EDIT_SCOPE_ACTIVE = "active_only"   # только активный слой (как до этапа 4)
+EDIT_SCOPES = (EDIT_SCOPE_ALL, EDIT_SCOPE_ACTIVE)
+
+# Per-layer режимы отсечения перехлёстов (этап 4 ТЗ, п. 7)
+CLIP_CLIP = "clip"      # автоотсечение, как раньше (по умолчанию)
+CLIP_ASK = "ask"        # спрашивать пользователя при перехлёсте
+CLIP_IGNORE = "ignore"  # не отсекать и не спрашивать
+CLIP_MODES = (CLIP_CLIP, CLIP_ASK, CLIP_IGNORE)
+
+# Протокол решения clip_decider (ответ на вопрос про перехлёст со слоем
+# в режиме «спрашивать»)
+CLIP_CHOICE_CLIP = "clip"    # обрезать перемещаемые по слою
+CLIP_CHOICE_KEEP = "keep"    # оставить перехлёст (не отсекать)
+CLIP_CHOICE_CANCEL = "cancel"  # отменить операцию целиком
+
+# Длина дуги 1° в метрах — перевод топологического допуска для слоёв
+# в градусных СК (этап 4 ТЗ, п. 2: допуск пропорционален погрешности
+# преобразования, которая масштабируется единицей СК)
+DEGREE_METERS = 111320.0
 
 # Что делать, если перемещаемые полигоны перекрывают другие объекты ТОГО ЖЕ
 # редактируемого слоя (перекрытия с эталонами других слоёв отсекаются как
@@ -81,6 +111,9 @@ MIN_MAX_NEIGHBORS = 100
 MAX_MAX_NEIGHBORS = 1000000
 MIN_TILE_FACTOR = 0.5
 MAX_TILE_FACTOR = 20.0
+
+# Правка нескольких слоёв (ТЗ этап 4)
+DEFAULT_EDIT_SCOPE = EDIT_SCOPE_ALL   # по умолчанию двигаются ВСЕ слои в правке
 
 # Границы допуска (в любых единицах)
 MIN_TOL = 0.1
@@ -566,6 +599,150 @@ def tile_factor():
     if value != value or value in (float("inf"), float("-inf")):
         return DEFAULT_TILE_FACTOR
     return min(max(value, MIN_TILE_FACTOR), MAX_TILE_FACTOR)
+
+
+def clip_mode_for(layer_id):
+    """Per-layer режим отсечения перехлёстов (этап 4 ТЗ, п. 7).
+
+    :param layer_id: id слоя (str)
+    :return: CLIP_CLIP (автоотсечение, по умолчанию) | CLIP_ASK | CLIP_IGNORE
+    """
+    raw = _clip_modes_raw()
+    return raw.get(str(layer_id or u""), CLIP_CLIP)
+
+
+def _clip_modes_raw():
+    """{layer_id: режим} из настроек (без валидации значений)."""
+    qs = _qsettings()
+    if qs is None:
+        return {}
+    try:
+        raw = qs.value(KEY_CLIP_MODES, u"", type=str)
+    except Exception:
+        return {}
+    out = {}
+    for part in parse_layer_ids(raw):
+        # формат «id:режим» — id сам может содержать «:», берём ПОСЛЕДНЕЕ
+        sep = part.rfind(u":")
+        if sep <= 0:
+            continue
+        lid = part[:sep]
+        mode = part[sep + 1:]
+        if lid and mode in CLIP_MODES:
+            out[lid] = mode
+    return out
+
+
+def set_clip_mode(layer_id, mode):
+    """Сохраняет per-layer режим отсечения (mode в CLIP_MODES или None —
+    вернуть к умолчанию «отсекать")."""
+    qs = _qsettings()
+    if qs is None:
+        return False
+    raw = _clip_modes_raw()
+    lid = str(layer_id or u"")
+    if not lid:
+        return False
+    if mode in CLIP_MODES and mode != CLIP_CLIP:
+        raw[lid] = mode
+    else:
+        raw.pop(lid, None)  # умолчание не храним — настройка компактнее
+    parts = [u"{}:{}".format(k, v) for k, v in raw.items()]
+    try:
+        qs.setValue(KEY_CLIP_MODES, u",".join(parts))
+        return True
+    except Exception:
+        return False
+
+
+def edit_scope():
+    """Область правки (этап 4 ТЗ, п. 1): EDIT_SCOPE_ALL (по умолчанию —
+    все слои в правке двигаются одной операцией) или EDIT_SCOPE_ACTIVE
+    (только активный слой — поведение до этапа 4)."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_EDIT_SCOPE
+    try:
+        value = qs.value(KEY_EDIT_SCOPE, DEFAULT_EDIT_SCOPE, type=str)
+    except Exception:
+        return DEFAULT_EDIT_SCOPE
+    return value if value in EDIT_SCOPES else DEFAULT_EDIT_SCOPE
+
+
+def set_edit_scope(scope):
+    """Сохраняет область правки (EDIT_SCOPE_*)."""
+    qs = _qsettings()
+    if qs is None:
+        return False
+    try:
+        qs.setValue(KEY_EDIT_SCOPE,
+                    scope if scope in EDIT_SCOPES else DEFAULT_EDIT_SCOPE)
+        return True
+    except Exception:
+        return False
+
+
+def edit_disabled_ids():
+    """Множество id слоёв, исключённых из многослойной правки
+    (чёрный список этапа 4, п. 1(б): слой в правке, но правится
+    только вручную/эталонами — операциями плагина не двигается)."""
+    qs = _qsettings()
+    if qs is None:
+        return set()
+    try:
+        return set(parse_layer_ids(
+            qs.value(KEY_EDIT_DISABLED, u"", type=str)))
+    except Exception:
+        return set()
+
+
+def set_edit_disabled(ids):
+    """Сохраняет чёрный список правки (iterable id слоёв)."""
+    qs = _qsettings()
+    if qs is None:
+        return False
+    parts = []
+    for lid in ids or ():
+        try:
+            s = str(lid).strip()
+        except Exception:
+            continue
+        if s:
+            parts.append(s)
+    try:
+        qs.setValue(KEY_EDIT_DISABLED, u",".join(parts))
+        return True
+    except Exception:
+        return False
+
+
+def is_edit_disabled(layer):
+    """True — слой исключён из многослойной правки настройками."""
+    if layer is None:
+        return False
+    try:
+        return layer.id() in edit_disabled_ids()
+    except Exception:
+        return False
+
+
+def edit_match_eps(layer):
+    """Топологический допуск слоя с поправкой на единицы его СК
+    (этап 4 ТЗ, п. 2).
+
+    Совпадение узлов считается после преобразования в СК карты; запись
+    идёт обратным преобразованием от единой точки карты — накопленный
+    дрейф пропорционален единице СК слоя. Для метрических СК —
+    TOPO_MATCH_EPS; для градусных — TOPO_MATCH_EPS * DEGREE_METERS
+    (примерно 0,11 м на земле — как 1e-6 м для метрических)."""
+    try:
+        from qgis.core import QgsUnitTypes
+        units = layer.crs().mapUnits()
+        if units == QgsUnitTypes.DistanceDegrees:
+            return TOPO_MATCH_EPS_CONST * DEGREE_METERS
+    except Exception:
+        pass
+    return TOPO_MATCH_EPS_CONST
 
 
 def validator_opts():

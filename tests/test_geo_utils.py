@@ -3032,6 +3032,450 @@ ti.shutdown_all()
 ut.note_operation_bbox(lyr33, None)
 
 # ---------------------------------------------------------------------------
+# 34. Этап 4 ТЗ: правка нескольких слоёв одной операцией
+#     (OperationLog, MultiLayerCommitter, участники, per-layer отсечение)
+# ---------------------------------------------------------------------------
+import topopolyedit.operation_log as oplog  # noqa: E402
+import topopolyedit.multi_editor as me  # noqa: E402
+
+
+class _OpStack(object):
+    """Стек отмены с index/text (как QgsUndoStack для журнала операций)."""
+
+    def __init__(self, n):
+        self._n = n
+        self.undone = 0
+
+    def index(self):
+        return self._n - self.undone
+
+    def canUndo(self):
+        return self._n - self.undone > 0
+
+    def text(self, i):
+        return "cmd%d" % (i + 1)
+
+    def undo(self):
+        if self.canUndo():
+            self.undone += 1
+            return True
+        return False
+
+
+class _OpLyr(object):
+    def __init__(self, lid, name, n_cmds=1):
+        self._lid = lid
+        self._name = name
+        self.stack = _OpStack(n_cmds)
+        self.undone_calls = []
+
+    def id(self):
+        return self._lid
+
+    def name(self):
+        return self._name
+
+    def undoStack(self):
+        return self.stack
+
+    def triggerRepaint(self):
+        pass
+
+
+def _resolver(*layers):
+    mapping = {l.id(): l for l in layers}
+
+    def resolve(lid):
+        if lid not in mapping:
+            raise RuntimeError(u"слой не найден")
+        return mapping[lid]
+    return resolve
+
+
+oplog.clear()
+lA, lB, lC = _OpLyr("A", "Слой А", 2), _OpLyr("B", "Слой Б", 1), _OpLyr("C", "Слой В", 1)
+# запись: [(layer_id, text, index_after)]
+seq34 = oplog.note_operation([("A", "cmd2", 2), ("B", "cmd1", 1)])
+check("34 журнал: операция зарегистрирована с seq",
+      seq34 is not None and oplog.last_operation() is not None and
+      len(oplog.last_operation()["layers"]) == 2)
+
+ok34, layers34, why34 = oplog.can_undo_operation(
+    oplog.last_operation(), _resolver(lA, lB))
+check("34 журнал: согласованная операция отменяется целиком",
+      ok34 and [l.id() for l in layers34] == ["A", "B"] and why34 == u"")
+
+# ручная правка после операции: index вырос -> отказ с объяснением
+lB.stack._n += 1  # пользователь добавил правку
+ok34, _l, why34 = oplog.can_undo_operation(oplog.last_operation(),
+                                           _resolver(lA, lB))
+check("34 журнал: правка слоя после операции — отказ «вручную»",
+      not ok34 and u"вручную" in why34)
+lB.stack._n -= 1
+
+# ручной undo после операции: index упал -> отказ
+lB.stack.undone += 1
+ok34, _l, why34 = oplog.can_undo_operation(oplog.last_operation(),
+                                           _resolver(lA, lB))
+check("34 журнал: частичный undo после операции — отказ «уже отменена»",
+      not ok34 and u"уже отменена" in why34)
+lB.stack.undone -= 1
+
+# верхняя команда другая (текст) — отказ
+lA.stack.text = lambda i: "чужая команда"
+ok34, _l, why34 = oplog.can_undo_operation(oplog.last_operation(),
+                                           _resolver(lA, lB))
+check("34 журнал: чужая команда сверху — отказ «вручную»",
+      not ok34 and u"вручную" in why34)
+del lA.stack.text  # вернуть исходный метод класса
+
+# слой удалён из проекта — отказ
+ok34, _l, why34 = oplog.can_undo_operation(oplog.last_operation(),
+                                           _resolver(lA))
+check("34 журнал: слой исчез из проекта — отказ без частичной отмены",
+      not ok34 and u"не в проекте" in why34)
+
+# успешный откат: обратный порядок записи (B, A)
+ok34, undone34 = oplog.undo_operation(oplog.last_operation(),
+                                      _resolver(lA, lB))
+check("34 журнал: undo_operation прошёл и вернул тексты команд",
+      ok34 and undone34 == ["cmd1", "cmd2"])
+check("34 журнал: undo() вызван в ОБРАТНОМ порядке записи (B первым)",
+      lB.stack.undone == 1 and lA.stack.undone == 1 and
+      lB.stack.undone >= lA.stack.undone)
+oplog.drop_last_operation()  # (кнопка «Отменить» снимает запись после успеха)
+check("34 журнал: запись снята после успешного отката",
+      oplog.last_operation() is None)
+
+# транзакционная группа: один undo() на первом слое (этап 4, п. 5)
+oplog.clear()
+lD, lE = _OpLyr("D", "Группа-1", 1), _OpLyr("E", "Группа-2", 1)
+oplog.note_operation([("D", "cmd1", 1), ("E", "cmd1", 1)],
+                     transaction_group=True)
+ok34, undone34 = oplog.undo_operation(oplog.last_operation(),
+                                      _resolver(lD, lE))
+check("34 ТГ: операция в группе откатывается ОДНИМ undo",
+      ok34 and undone34 == ["cmd1"] and
+      lD.stack.undone == 1 and lE.stack.undone == 0)
+
+# --- MultiLayerCommitter: атомарность записи (этап 4, п. 3) ---------------
+
+class _RealStack(object):
+    """Стек отмены с РЕАЛЬНЫМИ текстами команд и откатом-колбэком.
+
+    begin(text)/end() фиксируют команду (как в QGIS), undo() откатывает
+    через колбэк (восстановление геометрий слоя)."""
+
+    def __init__(self, on_undo=None):
+        self._cmds = []
+        self.undone = 0
+        self._open = None
+        self._on_undo = on_undo
+
+    def begin(self, text):
+        self._open = text
+
+    def end(self):
+        if self._open is not None:
+            self._cmds.append(self._open)
+            self._open = None
+
+    def destroy(self):
+        self._open = None
+
+    def index(self):
+        return len(self._cmds) - self.undone
+
+    def canUndo(self):
+        return self.index() > 0
+
+    def text(self, i):
+        return self._cmds[i]
+
+    def undo(self):
+        if self.canUndo():
+            self.undone += 1
+            if self._on_undo is not None:
+                self._on_undo()
+            return True
+        return False
+
+
+class _CommitLyr(_UndoEditLyr, QgsVectorLayer):
+    """Слой правки с буфером команд: changeGeometry копит изменения,
+    endEditCommand применяет (с geometryChanged), destroyEditCommand
+    отбрасывает — битовая целостность как у реального QgsVectorLayer.
+    undo стека восстанавливает исходные геометрии."""
+
+    def __init__(self, lid, feats, fail_fid=None):
+        _UndoEditLyr.__init__(self, feats)
+        self._lid = lid
+        self._fail_fid = fail_fid
+        self.destroyed = 0
+        self.begins = 0
+        self.ends = 0
+        self._orig = {f.id(): f._g for f in self._feats}
+        self._pending = {}
+        self.geometryChanged = _Sig()  # endEditCommand издаёт изменение
+        self.stack = _RealStack(on_undo=self._undo_geoms)
+
+    def _undo_geoms(self):
+        for f in self._feats:
+            g = self._orig.get(f.id())
+            if g is not None:
+                f._g = g
+
+    def id(self):
+        return self._lid
+
+    def name(self):
+        return self._lid
+
+    def type(self):
+        return QgsMapLayerType.VectorLayer
+
+    def beginEditCommand(self, text):
+        self.stack.begin(text)
+        self.begins += 1
+
+    def endEditCommand(self):
+        self.stack.end()
+        self.ends += 1
+        by_id = {f.id(): f for f in self._feats}
+        for fid, g in self._pending.items():
+            f = by_id.get(fid)
+            if f is not None:  # план может трогать чужие fid (стаб)
+                f._g = g
+                self.geometryChanged.emit(fid, g)
+        self._pending = {}
+
+    def destroyEditCommand(self):
+        self.stack.destroy()
+        self.destroyed += 1
+        self._pending = {}
+
+    def changeGeometry(self, fid, g):
+        if self._fail_fid is not None and fid == self._fail_fid:
+            return False
+        self._pending[fid] = g
+        return True
+
+
+def _feat34(layer, fid):
+    for f in layer._feats:
+        if f.id() == fid:
+            return f
+    raise KeyError(fid)
+
+
+feat_a34 = _UndoFeat(1, QgsGeometry.fromPolygonXY(
+    [ring((0, 0), (2, 0), (2, 2), (2, 4), (0, 4))]))
+feat_b34 = _UndoFeat(2, QgsGeometry.fromPolygonXY(
+    [ring((2, 0), (5, 0), (5, 4), (2, 4), (2, 2))]))
+
+plan34 = {"final": {1: "g1", 2: "g2"}, "write_order": [1, 2],
+          "final_clipped": {1: 0, 2: 0}, "t_fids": set(),
+          "old_geoms": {}, "eps": 1e-6, "bbox": None}
+
+cA = _CommitLyr("M-A", [feat_a34])
+cB = _CommitLyr("M-B", [feat_b34])
+committer34 = me.MultiLayerCommitter(u"Тестовый коммит")
+entries34 = committer34.commit_plans([(cA, plan34), (cB, plan34)])
+check("34 коммиттер: begin/end на ОБОИХ слоях, записи в оба",
+      cA.begins == 1 and cA.ends == 1 and cB.begins == 1 and cB.ends == 1
+      and cA.destroyed == 0 and cB.destroyed == 0 and
+      _feat34(cA, 1)._g == "g1" and _feat34(cB, 2)._g == "g2")
+check("34 коммиттер: возвращает индексы стеков после коммита",
+      [e[0] for e in entries34] == ["M-A", "M-B"] and
+      all(e[2] == 1 for e in entries34))
+
+# сбой записи во ВТОРОМ слое: ВСЕ команды уничтожены (этап 4, п. 3)
+cA2 = _CommitLyr("M-A", [feat_a34])
+cB2 = _CommitLyr("M-B", [feat_b34], fail_fid=1)
+committer34 = me.MultiLayerCommitter(u"Тестовый коммит")
+failed34 = False
+try:
+    committer34.commit_plans([(cA2, plan34), (cB2, plan34)])
+except RuntimeError:
+    failed34 = True
+check("34 коммиттер: сбой записи второго слоя даёт RuntimeError",
+      failed34)
+check("34 коммиттер: при сбое destroyEditCommand на ВСЕХ слоях (частичной записи нет)",
+      cA2.destroyed == 1 and cB2.destroyed == 1 and
+      cA2.ends == 0 and cB2.ends == 0)
+
+# --- транзакционная группа в коммиттере: ОДНА команда на группу -----------
+_key34 = oplog.layer_group_key
+try:
+    oplog.layer_group_key = lambda lyr: u"gpkg-conn-1"
+    cA3 = _CommitLyr("M-A", [feat_a34])
+    cB3 = _CommitLyr("M-B", [feat_b34])
+    committer34 = me.MultiLayerCommitter(u"ТГ-коммит")
+    committer34.commit_plans([(cA3, plan34), (cB3, plan34)])
+    check("34 ТГ-коммит: begin/end ОДИН раз (на первом слое), записи в оба",
+          committer34.transaction_group and cA3.begins == 1 and
+          cB3.begins == 0 and cA3.ends == 1 and cB3.ends == 0 and
+          _feat34(cA3, 1)._g == "g1" and _feat34(cB3, 2)._g == "g2")
+finally:
+    oplog.layer_group_key = _key34
+
+# --- участники операции (этап 4, п. 1(а)(б)) ------------------------------
+
+
+class _MapProject(object):
+    """Фейковый проект с mapLayers()/mapLayer() и деревом для прилипания."""
+
+    def __init__(self, layers, root=None):
+        self._layers = {l.id(): l for l in layers}
+        self._root = root if root is not None else _TreeRoot(children=[])
+
+    def mapLayers(self):
+        return dict(self._layers)
+
+    def mapLayer(self, lid):
+        return self._layers.get(lid)
+
+    def layerTreeRoot(self):
+        return self._root
+
+
+ed_l34 = _UndoLyr("ed34", True, True)     # в правке — участник
+off_l34 = _UndoLyr("off34", False, True)  # не в правке — не участник
+line_l34 = _UndoLyr("line34", True, True,
+                    QgsWkbTypes.LineGeometry)  # не полигон — не участник
+QgsProject._inst = _MapProject([ed_l34, off_l34, line_l34])
+_prim34 = _UndoLyr("prim34", True, True)
+
+got34 = me.candidate_edit_layers(_prim34)
+check("34 участники: режим «все слои в правке» — полигональные в правке",
+      [l.id() for l in got34] == ["id-prim34", "id-ed34"])
+
+_st34 = st.edit_scope
+try:
+    st.edit_scope = lambda: st.EDIT_SCOPE_ACTIVE
+    got34 = me.candidate_edit_layers(_prim34)
+    check("34 участники: режим «только активный слой» — один первичный",
+          [l.id() for l in got34] == ["id-prim34"])
+finally:
+    st.edit_scope = _st34
+
+_dis34 = st.edit_disabled_ids
+try:
+    st.edit_disabled_ids = lambda: {"id-ed34"}
+    got34 = me.candidate_edit_layers(_prim34)
+    check("34 участники: чёрный список правки исключает слой (п. 1(б))",
+          [l.id() for l in got34] == ["id-prim34"])
+finally:
+    st.edit_disabled_ids = _dis34
+
+# --- per-layer отсечение (этап 4, п. 7) -----------------------------------
+se.invalidate_snap_layers_cache()  # кэш дерева слоёв секций 29-33 пуст
+ref34 = _CommitLyr("REF34", [_UndoFeat(9, QgsGeometry.fromPolygonXY(
+    [ring((0, 0), (2, 0), (2, 4), (0, 4))]))])
+host34 = _CommitLyr("HOST34", [feat_a34])
+QgsProject._inst = _MapProject([ref34, host34], root=_TreeRoot(children=[
+    _TreeNode(layer=ref34)]))
+_clipmode34 = st.clip_mode_for
+try:
+    st.clip_mode_for = lambda lid: st.CLIP_CLIP
+    refs34 = te.TopoEditor(None, host34)._clip_references(
+        QgsRectangle(0, 0, 2, 4))
+    check("34 отсечение: режим «отсекать» (по умолчанию) — эталон взят",
+          len(refs34[0]) == 1 and refs34[1] is False and refs34[2] == [])
+
+    st.clip_mode_for = lambda lid: st.CLIP_IGNORE
+    refs34 = te.TopoEditor(None, host34)._clip_references(
+        QgsRectangle(0, 0, 2, 4))
+    check("34 отсечение: «не трогать» — слой вне эталонов",
+          len(refs34[0]) == 0 and len(refs34[2]) == 0)
+
+    st.clip_mode_for = lambda lid: st.CLIP_ASK
+    refs34 = te.TopoEditor(None, host34)._clip_references(
+        QgsRectangle(0, 0, 2, 4))
+    check("34 отсечение: «спрашивать» — геометрии отдельно с именем слоя",
+          len(refs34[0]) == 0 and len(refs34[2]) == 1 and
+          refs34[2][0][1] == "REF34")
+finally:
+    st.clip_mode_for = _clipmode34
+
+# участник операции не является эталоном (двигается вместе)
+st.clip_mode_for = lambda lid: st.CLIP_CLIP
+QgsProject._inst = _MapProject([ref34, host34, cA], root=_TreeRoot(children=[
+    _TreeNode(layer=ref34)]))
+refs34 = te.TopoEditor(None, host34)._clip_references(
+    QgsRectangle(0, 0, 2, 4), moving_layer_ids={"REF34"})
+check("34 отсечение: слой-участник операции исключён из эталонов",
+      len(refs34[0]) == 0)
+st.clip_mode_for = _clipmode34
+
+# --- многослойное перемещение узла end-to-end ------------------------------
+feat_a34 = _UndoFeat(1, QgsGeometry.fromPolygonXY(
+    [ring((0, 0), (2, 0), (2, 2), (2, 4), (0, 4))]))
+feat_b34 = _UndoFeat(2, QgsGeometry.fromPolygonXY(
+    [ring((2, 0), (5, 0), (5, 4), (2, 4), (2, 2))]))
+QgsProject._inst = _MapProject([])
+ut.note_edited_layer(None)
+oplog.clear()
+mA = _CommitLyr("ML-A", [feat_a34, feat_b34])
+# слой B: полигон с вершиной (2,2) и ребром (2,2)-(2,4) — общий узел с A
+mB = _CommitLyr("ML-B", [_UndoFeat(1, QgsGeometry.fromPolygonXY(
+    [ring((2, 2), (2, 4), (0, 4), (0, 2))]))])
+QgsProject._inst = _MapProject([mA, mB])
+_ed = me.TopoEditor(None, mB)
+_en = _ed._collect_moved(pt(2,2), pt(3,3), 1e-6)
+mel = me.MultiLayerEditor(None, mA)
+rep34 = mel.move_vertex(pt(2, 2), pt(3, 3))
+check("34 multi: перемещение узла меняет ОБА слоя (moved=3)",
+      rep34.get("error") is None and rep34.get("moved") == 3 and
+      len(rep34.get("participants") or []) == 2)
+check("34 multi: команды завершены на обоих слоях",
+      mA.ends == 1 and mB.ends == 1 and mA.destroyed == 0 and
+      mB.destroyed == 0)
+check("34 multi: геометрия слоя B уехала вместе с узлом",
+      gu.norm_polys(mB.getFeatures(None)[0].geometry())[0][0][0][0] ==
+      pt(3, 3))
+
+op34 = oplog.last_operation()
+check("34 multi: операция в журнале с ДВУМЯ слоями",
+      op34 is not None and len(op34["layers"]) == 2 and
+      not op34["transaction_group"])
+_res = _MapProject([mA, mB]).mapLayer
+ok34, undone34 = oplog.undo_operation(op34, _res)
+check("34 multi: одна отмена откатывает ОБА слоя",
+      ok34 and len(undone34) == 2 and
+      gu.norm_polys(mB.getFeatures(None)[0].geometry())[0][0][0][0] ==
+      pt(2, 2))
+oplog.drop_last_operation()
+
+# сбой записи во втором слое: ОБОИ слоя битово неизменены (приёмка ТЗ)
+mC = _CommitLyr("ML-C", [feat_a34, feat_b34])
+mD = _CommitLyr("ML-D", [_UndoFeat(1, QgsGeometry.fromPolygonXY(
+    [ring((2, 2), (2, 4), (0, 4), (0, 2))]))], fail_fid=1)
+QgsProject._inst = _MapProject([mC, mD])
+mel = me.MultiLayerEditor(None, mC)
+rep34 = mel.move_vertex(pt(2, 2), pt(3, 3))
+check("34 multi-сбой: операция отклонена с объяснением, moved=0",
+      rep34.get("error") is not None and rep34.get("moved") == 0)
+check("34 multi-сбой: destroyEditCommand на ОБОИХ слоях (битово целы)",
+      mC.destroyed == 1 and mD.destroyed == 1 and
+      mC.ends == 0 and mD.ends == 0)
+check("34 multi-сбой: геометрия первого слоя не изменилась",
+      gu.norm_polys(mC.getFeatures(None)[0].geometry())[0][0][0][2] ==
+      pt(2, 2))
+check("34 multi-сбой: журнальной записи нет (отмена не обещана)",
+      oplog.last_operation() is None)
+
+# один слой в правке: многослойный путь не ломает одиночную операцию
+QgsProject._inst = _MapProject([])
+oplog.clear()
+mE = _CommitLyr("ML-E", [feat_a34, feat_b34])
+mel = me.MultiLayerEditor(None, mE)
+rep34 = mel.move_vertex(pt(2, 2), pt(3, 3))
+check("34 multi-одиночный: один слой — moved=2, команда завершена",
+      rep34.get("error") is None and rep34.get("moved") == 2 and
+      mE.ends == 1 and mE.destroyed == 0)
+
+# ---------------------------------------------------------------------------
 print("")
 if FAILURES:
     print("ИТОГ: ПРОВАЛЕНО тестов: %d -> %s" % (len(FAILURES), FAILURES))

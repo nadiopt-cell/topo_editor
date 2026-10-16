@@ -57,6 +57,16 @@ OVERLAP_PREVIEW_INTERVAL = 0.08
 # валидация операции).
 GAP_PREVIEW_MAX_NEIGHBORS = 64
 
+# Палитра лент участников многослойной операции (этап 4, п. 6): цвет лент
+# по слою; первичный слой рисуется обычными оранжевыми лентами.
+MULTI_COLORS = (
+    (60, 130, 240),   # синий
+    (30, 170, 90),    # зелёный
+    (170, 60, 220),   # фиолетовый
+    (220, 120, 20),   # янтарный
+    (0, 170, 170),    # бирюзовый
+)
+
 
 class BaseTopoTool(QgsMapTool):
     """Базовый класс инструментов карты плагина."""
@@ -71,6 +81,9 @@ class BaseTopoTool(QgsMapTool):
         self.drag = None
         self.rubbers = []
         self._rubber_pool = []
+        # ленты участников многослойной операции (этап 4, п. 6):
+        # цвет по слою; удаляются после сброса (не попадают в пул)
+        self._multi_rubbers = []
 
         # маркер точки прилипания (фиолетовый круг)
         self.snap_marker = QgsVertexMarker(self.canvas())
@@ -189,14 +202,35 @@ class BaseTopoTool(QgsMapTool):
         self.rubbers.append(rb)
         return rb
 
+    def _make_multi_rubber(self, index):
+        """Лента участника многослойной операции (цвет по слою).
+
+        Ленты не переиспользуются (цвет меняется между захватами):
+        после сброса удаляются (_reset_poly_rubbers).
+        """
+        color = MULTI_COLORS[index % len(MULTI_COLORS)]
+        rb = QgsRubberBand(self.canvas(), QgsWkbTypes.PolygonGeometry)
+        rb.setStrokeColor(QColor(*color))
+        rb.setFillColor(QColor(color[0], color[1], color[2], 70))
+        rb.setWidth(2)
+        self.rubbers.append(rb)          # сброс в общий цикл
+        self._multi_rubbers.append(rb)   # удаление после сброса
+        return rb
+
     def _reset_poly_rubbers(self):
-        """Сброс активных лент (пул сохраняется для переиспользования)."""
+        """Сброс активных лент (пул сохраняется, цветные — удаляются)."""
         for rb in self.rubbers:
             try:
                 rb.reset(QgsWkbTypes.PolygonGeometry)
             except Exception:
                 pass
         self.rubbers = []
+        for rb in self._multi_rubbers:
+            try:
+                rb.deleteLater()
+            except Exception:
+                pass
+        self._multi_rubbers = []
 
     def _reset_snap_seg(self):
         """Сброс подсветки ребра прилипания."""
@@ -566,6 +600,45 @@ class BaseTopoTool(QgsMapTool):
         if clicked is b_keep:
             return CHOICE_KEEP
         return CHOICE_CANCEL
+
+    def _ask_clip(self, info):
+        """Диалог per-layer режима «спрашивать» (этап 4, п. 7).
+
+        Перемещение накладывается на объекты слоя ВНЕ правки, у
+        которого в настройках выбран режим «спрашивать».
+
+        :return: settings.CLIP_CHOICE_CLIP | CLIP_CHOICE_KEEP |
+                 CLIP_CHOICE_CANCEL
+        """
+        names = u", ".join(info.get("layer_names") or []) or u"?"
+        box = QMessageBox(self.iface.mainWindow())
+        box.setIcon(utils.enum_member(QMessageBox, "Icon", "Question"))
+        box.setWindowTitle(u"Перехлёст со слоем вне правки")
+        box.setText(u"Перемещение накладывает полигоны на объекты слоёв "
+                    u"вне режима правки: {}.".format(names))
+        box.setInformativeText(
+            u"Площадь наложения: {:.6g} (ед. слоя в квадрате).\n\n"
+            u"«Отрезать наложение» — перемещаемые полигоны будут "
+            u"обрезаны по объектам этих слоёв.\n"
+            u"«Оставить наложение» — перехлёст сохранится."
+            .format(info.get("area", 0.0)))
+        role_accept = utils.enum_member(QMessageBox, "ButtonRole",
+                                        "AcceptRole")
+        role_reject = utils.enum_member(QMessageBox, "ButtonRole",
+                                        "RejectRole")
+        b_clip = box.addButton(u"Отрезать наложение", role_accept)
+        b_keep = box.addButton(u"Оставить наложение", role_accept)
+        b_cancel = box.addButton(u"Отменить правку", role_reject)
+        box.setDefaultButton(b_clip)
+        box.setEscapeButton(b_cancel)
+        run = getattr(box, "exec_", None) or getattr(box, "exec")
+        run()
+        clicked = box.clickedButton()
+        if clicked is b_keep:
+            return settings.CLIP_CHOICE_KEEP
+        if clicked is b_cancel:
+            return settings.CLIP_CHOICE_CANCEL
+        return settings.CLIP_CHOICE_CLIP
 
     def _overlap_notes(self, report):
         """Фразы для отчёта: что случилось с перехлёстом (список строк)."""

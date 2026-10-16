@@ -30,6 +30,7 @@ from .topo_add_vertex_tool import TopoAddVertexTool
 from .audit_overlay import NodeAuditOverlay
 from .settings_dialog import SettingsDialog
 from . import topology_index
+from . import operation_log as oplog
 from . import settings
 from . import utils
 
@@ -233,15 +234,58 @@ class TopoPolyEditPlugin(object):
         settings.set_audit_enabled(bool(checked))
 
     def _on_undo_triggered(self):
-        """«Отменить правку»: откат последней операции на её слое.
+        """«Отменить правку»: откат последней операции плагина (этап 4).
 
-        Цель — utils.find_undo_target: последний слой, изменённый
-        плагином, затем активный слой, затем любой слой в правке с
-        непустым стеком отмены. Кнопка не дизейблится (чтобы не
-        повторять главную проблему штатной отмены — «непонятно почему
-        серая»): при отсутствии цели показывается поясняющее сообщение.
+        Основной путь — журнал операций (OperationLog): многослойная
+        операция откатывается на ВСЕХ затронутых слоях (в порядке,
+        обратном записи), операция в транзакционной группе — одним
+        undo() группового стека. Если после операции пользователь правил
+        один из слоёв вручную — отмена отказывается с объяснением:
+        слои не рассинхронизируются (ТЗ этап 4, п. 4).
+
+        Запасной путь (журнал пуст — правки сделаны до обновления
+        плагина) — прежний find_undo_target: последний слой,
+        изменённый плагином, затем активный слой, затем любой слой
+        в правке с непустым стеком отмены.
         """
         try:
+            op = oplog.last_operation()
+            if op is not None:
+                ok, undone = oplog.undo_operation(
+                    op, self._resolve_layer_by_id)
+                if ok:
+                    oplog.drop_last_operation()
+                    texts = u"; ".join(t for t in undone if t) or \
+                        u"последняя правка"
+                    if op.get("transaction_group"):
+                        detail = u"транзакционная группа, один откат"
+                    elif len(op["layers"]) > 1:
+                        detail = u"слоёв в операции: {}".format(
+                            len(op["layers"]))
+                    else:
+                        try:
+                            detail = u"слой «{}»".format(
+                                self._resolve_layer_by_id(
+                                    op["layers"][0][0]).name())
+                        except Exception:
+                            detail = u"слой"
+                    self.iface.messageBar().pushMessage(
+                        MENU_TITLE,
+                        u"Отменено: {} ({})".format(texts, detail),
+                        level=Qgis.Info, duration=4)
+                    self._repaint_layers(op)
+                    return
+                # отказ: слои НЕ рассинхронизируются, операция остаётся
+                # в журнале (после ручного восстановления состояния
+                # отмена повторяется)
+                self.iface.messageBar().pushMessage(
+                    MENU_TITLE,
+                    u"Отмена невозможна: {}. Слои не изменены."
+                    .format(undone),
+                    level=Qgis.Warning, duration=6)
+                return
+
+            # запасной путь: журнал пуст (правки до обновления плагина)
             layer = utils.find_undo_target(
                 QgsProject.instance().mapLayers().values(),
                 last_edited=utils.last_edited_layer(),
@@ -272,6 +316,23 @@ class TopoPolyEditPlugin(object):
                 MENU_TITLE, u"Не удалось отменить: {}".format(exc),
                 level=Qgis.Critical, duration=5)
 
+    def _resolve_layer_by_id(self, layer_id):
+        """Слой проекта по id (для журнала операций)."""
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if layer is None:
+            raise RuntimeError(u"слой не найден")
+        return layer
+
+    def _repaint_layers(self, op):
+        """Перерисовка затронутых слоёв после отката."""
+        for lid, _text, _idx in op.get("layers", []):
+            try:
+                layer = QgsProject.instance().mapLayer(lid)
+                if layer is not None:
+                    layer.triggerRepaint()
+            except Exception:
+                continue
+
     def _on_settings_triggered(self):
         try:
             dlg = SettingsDialog(self.iface, self.iface.mainWindow())
@@ -287,6 +348,11 @@ class TopoPolyEditPlugin(object):
         # индекс топологии (этап 3): снять все подписки на сигналы слоёв
         try:
             topology_index.shutdown_all()
+        except Exception:
+            pass
+        # журнал операций (этап 4): записи сессии — при выгрузке очистить
+        try:
+            oplog.clear()
         except Exception:
             pass
         # горячая клавиша Ctrl+Z: снять с канвы до удаления обработчика

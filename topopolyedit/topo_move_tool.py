@@ -25,7 +25,10 @@ from .geo_utils import (norm_polys, polys_to_geom, replace_vertices,
                         TOPO_MATCH_EPS, TOPO_MATCH_EPS2)
 from .snapping_engine import get_snap_layers
 from .topo_editor import TopoEditor
+from .multi_editor import (MultiLayerEditor, candidate_edit_layers,
+                           _Transforms, _map_crs)
 from .topo_tool_base import BaseTopoTool
+from . import settings
 from . import utils
 
 # Максимум маркеров связанных узлов (защита UI на очень плотных данных)
@@ -179,6 +182,54 @@ class TopoMoveTool(BaseTopoTool):
                 best = (lyr, picked, dist2, snap_eps, ct_m2l, ct_l2m)
         return best
 
+    def _collect_multi_participants(self, drag):
+        """Участники многослойной операции (этап 4, п. 1): слои в правке,
+        не в чёрном списке правки, с вершиной/ребром под узлом.
+
+        Собирает entries каждого участника (для цветных лент и превью);
+        первичный слой НЕ входит в drag["multi"] — он уже в
+        drag["entries"] (оранжевые ленты, как раньше).
+        """
+        drag["multi"] = []
+        drag["multi_names"] = []
+        try:
+            candidates = candidate_edit_layers(drag["layer"])
+        except Exception as exc:
+            utils.log(u"Этап 4: участники не собраны — {}".format(exc))
+            return
+        if len(candidates) <= 1:
+            return
+        old_map = drag["ct_l2m"].transform(QgsPointXY(drag["picked"]))
+        map_crs = _map_crs(self.iface, drag["layer"])
+        color_index = 0
+        for lyr in candidates:
+            if lyr.id() == drag["layer"].id():
+                continue
+            try:
+                tf = _Transforms(map_crs, lyr)
+                old_l = tf.to_layer(old_map)
+                eps_l = settings.edit_match_eps(lyr)
+                entries_l, _related = self._collect_move_set(
+                    lyr, old_l, eps_l)
+            except Exception as exc:
+                utils.log(u"Этап 4: слой «{}» пропущен — {}"
+                          .format(lyr.name(), exc))
+                continue
+            if not entries_l:
+                continue  # нет узла/ребра под точкой (критерий (в))
+            rb = self._make_multi_rubber(color_index)
+            drag["multi"].append({"layer": lyr, "entries": entries_l,
+                                  "tf": tf, "old_l": old_l,
+                                  "rubber": rb})
+            drag["multi_names"].append(u"{} ({})".format(
+                lyr.name(), len(entries_l)))
+            color_index += 1
+        if drag["multi"]:
+            # подпись превью (этап 4, п. 6): какие слои будут изменены
+            self._preview_note = u"изменятся слои: «{}» ({})".format(
+                drag["layer"].name(), len(drag["entries"])) + \
+                u", " + u", ".join(drag["multi_names"])
+
     # ------------------------------------------------------------------
     # События карты
     # ------------------------------------------------------------------
@@ -247,6 +298,9 @@ class TopoMoveTool(BaseTopoTool):
             }
             for _ in entries:
                 self._make_polygon_rubber()
+            # участники многослойной операции (этап 4): цветные ленты
+            # и подпись «изменятся слои…» в строке состояния
+            self._collect_multi_participants(drag)
             # подсветка всех связанных вершин сразу после захвата
             try:
                 pts_map = [ct_l2m.transform(QgsPointXY(p)) for p in related]
@@ -288,11 +342,27 @@ class TopoMoveTool(BaseTopoTool):
             if new_pt.sqrDist(drag["picked"]) <= TOPO_MATCH_EPS2:
                 self._cleanup()
                 return
-            editor = TopoEditor(self.iface, drag["layer"], self._ask_overlap,
-                                self._ask_makevalid)
-            report = editor.move_vertex(
-                drag["picked"], new_pt, drag["match_eps"])
-            self._report(report, drag["ct_l2m"])
+            if drag.get("multi"):
+                # многослойная операция (этап 4): все слои в правке
+                # с общим узлом двигаются одной атомарной операцией
+                m_editor = MultiLayerEditor(
+                    self.iface, drag["layer"], self._ask_overlap,
+                    self._ask_makevalid, self._ask_clip)
+                report = m_editor.move_vertex(
+                    drag["picked"], new_pt, drag["match_eps"],
+                    ct_m2l=drag["ct_m2l"], ct_l2m=drag["ct_l2m"])
+                report["multi"] = True
+                # точки нарушений в CRS слоя-нарушителя: кнопка «Показать
+                # место» корректна только при единой СК участников
+                ct = drag["ct_l2m"] if report.get("crs_uniform") else None
+                self._report(report, ct)
+            else:
+                editor = TopoEditor(self.iface, drag["layer"],
+                                    self._ask_overlap, self._ask_makevalid,
+                                    self._ask_clip)
+                report = editor.move_vertex(
+                    drag["picked"], new_pt, drag["match_eps"])
+                self._report(report, drag["ct_l2m"])
         except Exception as exc:
             self._push_error(exc)
         finally:
@@ -331,7 +401,7 @@ class TopoMoveTool(BaseTopoTool):
             pass
 
     def _update_preview(self, map_pt, snap):
-        """Резиновые ленты всех перемещаемых полигонов."""
+        """Резиновые ленты всех перемещаемых полигонов (все участники)."""
         drag = self.drag
         if drag is None:
             return
@@ -352,6 +422,25 @@ class TopoMoveTool(BaseTopoTool):
             except Exception:
                 pass
             rb.setToGeometry(g, None)
+        # участники многослойной операции (этап 4, п. 6): свои координаты
+        # и цвет лент; единая точка — через CRS карты
+        if drag.get("multi"):
+            try:
+                new_map = drag["ct_l2m"].transform(QgsPointXY(new_pt))
+            except Exception:
+                new_map = None
+            if new_map is not None:
+                for part in drag["multi"]:
+                    new_l = part["tf"].to_layer(new_map)
+                    eps2_l = settings.edit_match_eps(part["layer"]) ** 2
+                    for en in part["entries"]:
+                        new_polys, _ch = replace_vertices(
+                            en["polys"], part["old_l"], new_l, eps2_l)
+                        g = polys_to_geom(new_polys, en["multi"])
+                        try:
+                            part["rubber"].setToGeometry(g, None)
+                        except Exception:
+                            pass
         self._update_validator_preview(drag["layer"], drag["ct_l2m"], prepared)
 
     def _report(self, report, ct_l2m=None):
