@@ -82,8 +82,10 @@ def test_update_preview_takes_single_delta():
 def test_enum_member_works_on_real_qt():
     from qgis.core import Qgis, QgsWkbTypes
     from topopolyedit import utils
-    assert utils.enum_member(Qgis.Info) is not None
-    assert utils.enum_member(QgsWkbTypes.PolygonGeometry) is not None
+    # реальная сигнатура хелпера: (owner, enum_name, member)
+    assert utils.enum_member(Qgis, "MessageLevel", "Info") is not None
+    assert utils.enum_member(
+        QgsWkbTypes, "GeometryType", "PolygonGeometry") is not None
 
 
 # --- равенство CRS-объектов (v1.6.3) ---------------------------------------
@@ -111,11 +113,12 @@ def test_rubber_pool_does_not_grow_scene(iface_canvas):
     rb2 = tool._make_polygon_rubber()
     assert rb1 is rb2, "лента должна переиспользоваться из пула"
     scene = iface_canvas.mapCanvas().scene()
-    count_after_warm = scene.items().count()
+    # scene.items() на настоящем Qt — список Python: только len()
+    count_after_warm = len(scene.items())
     for _ in range(10):
         tool._make_polygon_rubber()
         tool._reset_poly_rubbers()
-    assert scene.items().count() == count_after_warm, (
+    assert len(scene.items()) == count_after_warm, (
         "регрессия v1.6.3: сцена холста растёт при перетаскивании — "
         "ленты не переиспользуются")
     tool.deactivate()

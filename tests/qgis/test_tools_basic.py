@@ -130,7 +130,8 @@ def test_tjunction_current_behavior_documented(editor_keep, stub_iface):
         # A не должен измениться вовсе (его вершины не двигались)
         geom_a = _geom_by_tag(layer, "A")
         assert _vertex_count(geom_a) == 4, (
-            "A изменился без причины")
+            "A изменился без причины (вершин теперь: {})".format(
+                _vertex_count(geom_a)))
         # и в A нет вершины в (5,10) — дыра И4, документируем
         assert not _has_point_as_vertex(geom_a, _pt(5.0, 10.0))
     finally:
@@ -169,8 +170,14 @@ def _geom_by_tag(layer, tag):
 
 
 def _vertex_count(geom):
+    """Число вершин без замыкающей точки кольца.
+
+    asPolygon/asMultiPolygon возвращают ЗАКРЫТЫЕ кольца (первая точка
+    повторяется в конце), поэтому четырёхугольник — это 5 точек кольца,
+    но 4 вершины. Регрессия этапа 0: подсчёт без вычитания замыкающей
+    точки делал сравнение всегда ложным."""
     parts = geom.asMultiPolygon() if geom.isMultipart() else [geom.asPolygon()]
-    return sum(len(ring) for poly in parts for ring in poly)
+    return sum(max(len(ring) - 1, 0) for poly in parts for ring in poly)
 
 
 def _has_vertex(layer, pt):

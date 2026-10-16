@@ -23,9 +23,9 @@ GRID_CELL = 10.0
 PERTURBED = {(1, 1): (10.3, 10.2), (2, 1): (19.7, 10.4)}
 
 
-def _memory_polygon_layer(name, crs="EPSG:3857"):
+def _memory_polygon_layer(name, crs="EPSG:3857", wkb="Polygon"):
     layer = QgsVectorLayer(
-        "Polygon?crs={}&index=no".format(crs), name, "memory")
+        "{}?crs={}&index=no".format(wkb, crs), name, "memory")
     assert layer.isValid(), "memory-слой не создан: " + name
     layer.dataProvider().addAttributes([QgsField("id", QVariant.String)])
     layer.updateFields()
@@ -92,6 +92,14 @@ def _grid_node(i, j):
 def make_cadastral_layer(name="kadastr", crs="EPSG:3857"):
     """«Кадастр» 3x2: непрямые границы, дыра, мультиполигон.
 
+    Слой создаётся с типом MultiPolygon — типичное хранение кадастра
+    при смешанном содержимом (одиночные участки + участок с дырой +
+    мультиполигон из двух частей). Находка этапа 0 (CI): в слое с
+    типом Polygon мультиполигон из ДВУХ частей не перемещается —
+    _fit_to_layer возвращает None с текстом «слой не допускает
+    мультигеометрию»; ограничение задокументировано в ТЗ (исходное
+    состояние) и будет снято валидатором этапа 1 с понятным текстом.
+
     Общие узлы строк разделены детерминированными сдвигами (PERTURBED),
     поэтому общие границы становятся двухсегментными. Участок 2,0 —
     полигон с дырой; участок 2,1 — мультиполигон из двух частей
@@ -99,7 +107,7 @@ def make_cadastral_layer(name="kadastr", crs="EPSG:3857"):
 
     :return: (QgsVectorLayer, {"tags": {(i, j): fid}})
     """
-    layer = _memory_polygon_layer(name, crs)
+    layer = _memory_polygon_layer(name, crs, wkb="MultiPolygon")
     tags = {}
 
     def node(i, j):
