@@ -1,0 +1,44 @@
+# CI TopoPolyEdit: офлайн-тесты ядра + тесты на настоящем QGIS (этап 0 ТЗ).
+# Матрица: LTR 3.34, LTR 3.40, последний релиз (docker-образы qgis/qgis).
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  qgis:
+    name: QGIS ${{ matrix.qgis-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        qgis-version: ["3.34", "3.40", "latest"]
+    container:
+      image: qgis/qgis:${{ matrix.qgis-version }}
+      options: --entrypoint /bin/bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка тестовых зависимостей
+        run: |
+          python3 -m pip install --no-cache-dir pytest pytest-qgis hypothesis \
+            || python3 -m pip install --no-cache-dir \
+                 --break-system-packages pytest pytest-qgis hypothesis
+
+      - name: Офлайн-тесты ядра (без QGIS)
+        run: python3 tests/test_geo_utils.py
+
+      - name: Тесты на настоящем QGIS
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 -m pytest tests/qgis -v --tb=short
+
+      - name: Компиляция всех модулей плагина
+        run: |
+          python3 - <<'PY'
+          import compileall, sys
+          ok = compileall.compile_dir('topopolyedit', quiet=1)
+          sys.exit(0 if ok else 1)
+          PY
