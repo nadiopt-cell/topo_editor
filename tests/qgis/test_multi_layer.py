@@ -351,6 +351,12 @@ def test_active_only_scope(project_crs_3857, two_shared_node_layers,
     layer_a, layer_b = two_shared_node_layers
     monkeypatch.setattr(settings, "edit_scope",
                         lambda: settings.EDIT_SCOPE_ACTIVE)
+    # слой B в правке, но вне области операции: по ТЗ (п. 7) остаётся
+    # эталоном отсечения, что честно режет перемещаемые A при общем
+    # узле; для чистой проверки ОБЛАСТИ правки отключаем отсечение
+    monkeypatch.setattr(settings, "clip_mode_for",
+                        lambda lid: settings.CLIP_IGNORE
+                        if lid == layer_b.id() else settings.CLIP_CLIP)
     editor = MultiLayerEditor(None, layer_a)
     report = editor.move_vertex(QgsPointXY(10, 10), QgsPointXY(11, 11))
     assert report.get("error") is None, report.get("error")
