@@ -33,20 +33,30 @@ def _clean_journal():
     oplog.clear()
 
 
+def _project():
+    """Текущий проект QGIS (pytest-qgis не даёт фикстуру qgis_project)."""
+    return QgsProject.instance()
+
+
 @pytest.fixture
-def project_crs_3857(qgis_project):
+def project_crs_3857():
     """Проектный CRS = EPSG:3857 (единая точка операции — метры)."""
-    qgis_project.setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
-    return qgis_project
+    _project().setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
+    yield _project()
+    # вернуть режим транзакций, если тест его менял
+    try:
+        _project().setTransactionMode(_transaction_mode_disabled())
+    except Exception:
+        pass
 
 
 @pytest.fixture
-def two_shared_node_layers(qgis_project):
+def two_shared_node_layers():
     """Два memory-слоя в правке с общими узлами сетки 2x1."""
     layer_a, _tags_a = make_grid_layer(2, 1, name="multi_a")
     layer_b, _tags_b = make_grid_layer(2, 1, name="multi_b")
     for lyr in (layer_a, layer_b):
-        qgis_project.addMapLayer(lyr)
+        _project().addMapLayer(lyr)
         lyr.startEditing()
     yield layer_a, layer_b
     for lyr in (layer_a, layer_b):
@@ -54,7 +64,7 @@ def two_shared_node_layers(qgis_project):
             lyr.rollBack()
         except Exception:
             pass
-        qgis_project.removeMapLayer(lyr.id())
+        _project().removeMapLayer(lyr.id())
 
 
 def _ring_pts(layer, fid):
@@ -102,7 +112,7 @@ def test_two_layers_move_and_single_undo(project_crs_3857,
     # одна отмена откатывает ОБОИ слоя (OperationLog, ТЗ п. 4)
     op = oplog.last_operation()
     assert op is not None and len(op["layers"]) == 2
-    ok, _undone = oplog.undo_operation(op, project_crs_3857.mapLayer)
+    ok, _undone = oplog.undo_operation(op, _project().mapLayer)
     assert ok
     oplog.drop_last_operation()
     for lyr in (layer_a, layer_b):
@@ -168,7 +178,7 @@ def test_different_crs_nodes_stay_aligned(project_crs_3857,
                                           qgis_project):
     layer_a, _unused = two_shared_node_layers
     layer_b = _transform_layer_to_4326(layer_a, "multi_crs")
-    qgis_project.addMapLayer(layer_b)
+    _project().addMapLayer(layer_b)
     layer_b.startEditing()
     try:
         # допуск совмещения слоя B (градусная СК -> ~0.11 м на земле)
@@ -205,7 +215,7 @@ def test_different_crs_nodes_stay_aligned(project_crs_3857,
             layer_b.rollBack()
         except Exception:
             pass
-        qgis_project.removeMapLayer(layer_b.id())
+        _project().removeMapLayer(layer_b.id())
 
 
 # ---------------------------------------------------------------------------
@@ -236,20 +246,18 @@ def _make_gpkg_two_layers(tmp_path):
     return path
 
 
-def test_transaction_group_single_undo(tmp_path, qgis_project,
-                                       project_crs_3857):
+def test_transaction_group_single_undo(tmp_path, project_crs_3857):
     path = _make_gpkg_two_layers(tmp_path)
     try:
-        qgis_project.setTransactionMode(
-            utils_enum_transaction_mode())
+        _project().setTransactionMode(_transaction_mode_automatic())
     except Exception:
         pytest.skip("QGIS без TransactionMode (старая версия)")
 
     layer_a = QgsVectorLayer("{}|layername=t1".format(path), "t1", "ogr")
     layer_b = QgsVectorLayer("{}|layername=t2".format(path), "t2", "ogr")
     assert layer_a.isValid() and layer_b.isValid()
-    qgis_project.addMapLayer(layer_a)
-    qgis_project.addMapLayer(layer_b)
+    _project().addMapLayer(layer_a)
+    _project().addMapLayer(layer_b)
     layer_a.startEditing()
     layer_b.startEditing()
     try:
@@ -267,7 +275,7 @@ def test_transaction_group_single_undo(tmp_path, qgis_project,
         # в журнале операция помечена transaction_group: откат ОДНИМ undo
         op = oplog.last_operation()
         assert op is not None and op.get("transaction_group") is True
-        ok, _undone = oplog.undo_operation(op, qgis_project.mapLayer)
+        ok, _undone = oplog.undo_operation(op, _project().mapLayer)
         assert ok
         oplog.drop_last_operation()
         # без рассинхронизации: ОБОИ слоя вернулись
@@ -280,18 +288,23 @@ def test_transaction_group_single_undo(tmp_path, qgis_project,
                 lyr.rollBack()
             except Exception:
                 pass
-            qgis_project.removeMapLayer(lyr.id())
+            _project().removeMapLayer(lyr.id())
 
 
-def utils_enum_transaction_mode():
+def _transaction_mode_automatic():
     """QgsProject.TransactionMode.AutomaticGroups (PyQt5/PyQt6)."""
-    try:
-        scope = getattr(QgsProject, "TransactionMode", None)
-        if scope is not None and hasattr(scope, "AutomaticGroups"):
-            return scope.AutomaticGroups
-        return QgsProject.AutomaticGroups
-    except Exception:
-        raise
+    scope = getattr(QgsProject, "TransactionMode", None)
+    if scope is not None and hasattr(scope, "AutomaticGroups"):
+        return scope.AutomaticGroups
+    return QgsProject.AutomaticGroups
+
+
+def _transaction_mode_disabled():
+    """TransactionMode.Disabled (значение по умолчанию проекта)."""
+    scope = getattr(QgsProject, "TransactionMode", None)
+    if scope is not None and hasattr(scope, "Disabled"):
+        return scope.Disabled
+    return getattr(QgsProject, "TransactionDisabled", 0)
 
 
 # ---------------------------------------------------------------------------

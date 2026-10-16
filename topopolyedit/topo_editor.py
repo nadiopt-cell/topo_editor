@@ -726,7 +726,7 @@ class TopoEditor(object):
             g = polys_to_geom(e["polys"], e["multi"])
             if g.isNull() or g.isEmpty():
                 report["error"] = u"Перемещаемый полигон без геометрии"
-                return report
+                return report, None
             if not g.isGeosValid():
                 # Этап 1 ТЗ: makeValid из конвейера убран. Невалидная
                 # геометрия — блокировка с точкой нарушения; ремонт —
@@ -740,7 +740,7 @@ class TopoEditor(object):
                         u"геометрия — операция отменена, слой не изменён"
                         .format(e["fid"]))
                     report["violations"] = [v.to_dict() for v in violations]
-                    return report
+                    return report, None
                 g = gv
                 report["makevalid_repaired"] += 1
 
@@ -749,13 +749,13 @@ class TopoEditor(object):
             except Exception as exc:
                 report["error"] = u"Отсечение #{}: сбой — {}".format(
                     e["fid"], exc)
-                return report
+                return report, None
 
             if g.isNull() or g.isEmpty():
                 report["error"] = (
                     u"Отсечение полностью поглотило полигон #{} — "
                     u"операция отменена".format(e["fid"]))
-                return report
+                return report, None
             fitted = self._fit_to_layer(g)
             if fitted is None:
                 report["error"] = (
@@ -764,14 +764,14 @@ class TopoEditor(object):
                     u"результат нельзя. Используйте слой типа "
                     u"MultiPolygon или разберите фичу на части.".format(
                         e["fid"]))
-                return report
+                return report, None
             if not fitted.isGeosValid():
                 violations = GeosValidity().check(e["fid"], fitted)
                 report["error"] = (
                     u"Отсечение полигона #{} дало невалидную геометрию — "
                     u"операция отменена, слой не изменён".format(e["fid"]))
                 report["violations"] = [v.to_dict() for v in violations]
-                return report
+                return report, None
             prepared.append((e, fitted, clipped_here))
 
         # --- 1б. перехлёст со слоями «спрашивать» (этап 4, п. 7) --------
@@ -810,7 +810,7 @@ class TopoEditor(object):
                     pass  # оставить перехлёст — не отсекаем
                 elif decision == settings.CLIP_CHOICE_CANCEL:
                     report["cancelled"] = True
-                    return report
+                    return report, None
                 else:
                     # «отсекать»: обрезаем перемещаемые по ask-эталонам
                     ask_geoms = [g for g, _n in ask_refs]
@@ -822,13 +822,13 @@ class TopoEditor(object):
                             report["error"] = (
                                 u"Отсечение по слою «спрашивать» #{}: "
                                 u"сбой — {}".format(e["fid"], exc))
-                            return report
+                            return report, None
                         if g2.isNull() or g2.isEmpty():
                             report["error"] = (
                                 u"Отсечение по слою «спрашивать» полностью "
                                 u"поглотило полигон #{} — операция отменена"
                                 .format(e["fid"]))
-                            return report
+                            return report, None
                         fitted = self._fit_to_layer(g2)
                         if fitted is None:
                             report["error"] = (
@@ -836,7 +836,7 @@ class TopoEditor(object):
                                 u"нескольких частей, а слой объявлен с "
                                 u"типом «одиночный полигон»"
                                 .format(e["fid"]))
-                            return report
+                            return report, None
                         new_prepared.append(
                             (e, fitted, clipped_here + more))
                     prepared = new_prepared
@@ -872,7 +872,7 @@ class TopoEditor(object):
             report["overlap_choice"] = choice
             if choice == CHOICE_CANCEL:
                 report["cancelled"] = True
-                return report  # до beginEditCommand — слой не тронут
+                return report, None  # до beginEditCommand — слой не тронут
 
         by_moved = {}     # fid перемещаемого -> [fid соседей-перехлёстов]
         by_neighbor = {}  # fid соседа -> [fid перемещаемых]
@@ -933,7 +933,7 @@ class TopoEditor(object):
                     final[nfid] = fitted
         except RuntimeError as exc:
             report["error"] = str(exc)
-            return report
+            return report, None
 
         # --- 3б. T-залатывание по НОВЫМ позициям (этап 2 ТЗ, п. 3) ------
         # Узел прилип к ребру СВОЕГО слоя: в это ребро вставляется
@@ -946,7 +946,7 @@ class TopoEditor(object):
                                                     set(final.keys()), eps)
             except Exception as exc:
                 report["error"] = u"T-залатывание: сбой — {}".format(exc)
-                return report
+                return report, None
             for t in t_entries:
                 final[t["fid"]] = polys_to_geom(t["polys"], t["multi"])
                 t_fids.add(t["fid"])
@@ -965,7 +965,7 @@ class TopoEditor(object):
                 # нельзя: валидация без соседей пропустила бы потерю
                 # общих узлов и новые щели.
                 report["error"] = str(exc)
-                return report
+                return report, None
             except Exception:
                 neighbors = []  # индекс/слой не ответили — проверка по затронутым
         old_geoms = self._old_geoms(set(final.keys()))
@@ -983,7 +983,7 @@ class TopoEditor(object):
             if len(errors) > 3:
                 report["error"] += u" (и ещё {})".format(len(errors) - 3)
             report["violations"] = [v.to_dict() for v in violations]
-            return report
+            return report, None
         warnings = [v for v in violations if v.severity == SEV_WARNING]
         if warnings:
             report["warnings"] = [v.to_dict() for v in warnings]
