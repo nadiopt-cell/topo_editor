@@ -194,9 +194,10 @@ def test_different_crs_nodes_stay_aligned(project_crs_3857,
     _project().addMapLayer(layer_b)
     layer_b.startEditing()
     try:
-        # допуск совмещения слоя B (градусная СК -> ~0.11 м на земле)
+        # допуск задаётся в ЕДИНИЦАХ СК слоя: 1e-6° (не умножается на
+        # длину градуса — иначе 12 км и склейка соседних узлов сетки)
         eps_b = settings.edit_match_eps(layer_b)
-        assert eps_b > 0.05  # пропорционален погрешности преобразования
+        assert 1e-9 < eps_b < 1e-4  # миллионные доли единицы СК
 
         editor = MultiLayerEditor(None, layer_a)
         report = editor.move_vertex(QgsPointXY(10, 10),
