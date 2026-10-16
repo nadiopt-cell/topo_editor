@@ -260,6 +260,66 @@ class QgsGeometry(object):
     def asMultiPolyline(self):
         return self._data["lines"]
 
+    def _iter_pts(self):
+        d = self._data or {}
+        if d.get("type") == QgsWkbTypes.PolygonGeometry:
+            for poly in d["polys"]:
+                for ring in poly:
+                    for p in ring:
+                        yield p
+        elif d.get("type") == QgsWkbTypes.LineGeometry:
+            for line in d["lines"]:
+                for p in line:
+                    yield p
+        elif d.get("type") == QgsWkbTypes.PointGeometry:
+            for part in d["points"]:
+                for p in part:
+                    yield p
+
+    def boundingBox(self):
+        """Этап 2: габарит (нужен find_overlaps «перемещаемые × перемещаемые»)."""
+        xs, ys = [], []
+        for p in self._iter_pts():
+            xs.append(p.x())
+            ys.append(p.y())
+        if not xs:
+            return QgsRectangle(0.0, 0.0, 0.0, 0.0)
+        return QgsRectangle(min(xs), min(ys), max(xs), max(ys))
+
+    def area(self):
+        """Этап 2: площадь шиловой формулой (внешние минус внутренние)."""
+        total = 0.0
+        d = self._data or {}
+        if d.get("type") != QgsWkbTypes.PolygonGeometry:
+            return 0.0
+        for poly in d["polys"]:
+            for _ri, ring in enumerate(poly):
+                pts = ring[:-1] if len(ring) > 1 and \
+                    ring[0].x() == ring[-1].x() and \
+                    ring[0].y() == ring[-1].y() else list(ring)
+                s = 0.0
+                n = len(pts)
+                for i in range(n):
+                    a, b = pts[i], pts[(i + 1) % n]
+                    s += a.x() * b.y() - b.x() * a.y()
+                s = abs(s) / 2.0
+                total = s if _ri == 0 else total - s
+        return total
+
+    def intersects(self, other):
+        # консервативно: пересечение габаритов
+        return self.boundingBox().intersects(other.boundingBox())
+
+    def intersection(self, other):
+        """Стаб: площадьного пересечения не умеет — возвращает ОБЩУЮ
+        ГРАНИЦУ (линию). find_overlaps получит не-полигон и пропустит
+        пару (polygon_only -> None): смежные перемещаемые полигоны
+        (общий край) перехлёстом не считаются — как в реальном GEOS."""
+        if self._data is None or getattr(other, "_data", None) is None:
+            return QgsGeometry()
+        return QgsGeometry.fromPolylineXY([QgsPointXY(0, 0),
+                                           QgsPointXY(0, 0)])
+
 
 core_mod.QgsPointXY = QgsPointXY
 core_mod.QgsRectangle = QgsRectangle
