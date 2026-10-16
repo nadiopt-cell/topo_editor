@@ -589,11 +589,27 @@ class TopoEditor(object):
         # --- 2. перехлёст с объектами того же слоя ----------------------
         overlaps = []
         neighbors = []
+        prepared_geom = {}  # fid -> подготовленная геометрия перемещаемой
         if prepared and settings.overlap_mode() != settings.OVERLAP_KEEP:
             neighbors = self._same_layer_neighbors(bbox, set(exclude_ids))
+            prepared_pairs = [(e["fid"], g) for e, g, _c in prepared]
+            prepared_geom = dict(prepared_pairs)
             if neighbors:
-                overlaps = find_overlaps(
-                    [(e["fid"], g) for e, g, _c in prepared], neighbors)
+                overlaps = find_overlaps(prepared_pairs, neighbors)
+            # Перехлёсты МЕЖДУ перемещаемыми (этап 2): T-залатывание может
+            # наклонить ребро одного перемещаемого полигона внутрь другого
+            # (клин у общего края). До этапа 2 перемещаемые не могли
+            # наехлеститься друг на друга. Каждая пара учитывается один раз.
+            if len(prepared_pairs) > 1:
+                seen_pairs = set()
+                for o in find_overlaps(prepared_pairs, prepared_pairs):
+                    if o["moved"] == o["neighbor"]:
+                        continue
+                    key = (min(o["moved"], o["neighbor"]),
+                           max(o["moved"], o["neighbor"]))
+                    if key not in seen_pairs:
+                        seen_pairs.add(key)
+                        overlaps.append(o)
         choice = CHOICE_KEEP
         if overlaps:
             report["overlaps"] = len({o["neighbor"] for o in overlaps})
@@ -609,6 +625,11 @@ class TopoEditor(object):
             by_moved.setdefault(o["moved"], []).append(o["neighbor"])
             by_neighbor.setdefault(o["neighbor"], []).append(o["moved"])
         neighbor_geom = dict(neighbors)
+        # партнёр по перехлёсту может быть сам перемещаемым (T-клин):
+        # геометрия для отсечения — его ПОДГОТОВЛЕННАЯ геометрия
+        for fid, g in prepared_geom.items():
+            if fid in by_neighbor and fid not in neighbor_geom:
+                neighbor_geom[fid] = g
 
         # --- 3. план: все геометрии к записи (ДО открытия команды) ------
         # План считается до beginEditCommand: валидатор проверяет
