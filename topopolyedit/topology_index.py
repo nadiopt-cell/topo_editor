@@ -18,8 +18,12 @@
 
 Плитки (п. 2): индекс строится лениво по квадратным плиткам; размер
 задаётся при первой сборке как видимый экстент × tile_factor
-(настройка, по умолчанию 2). Сборка плитки ограничена бюджетом
-TILE_BUILD_BUDGET_S (0.4 с, как в аудите 1.6.1): при превышении плитка
+(настройка, по умолчанию 2). На слоях с десятками тысяч фич сетка
+дробится по плотности (порядка _TILE_TARGET_FEATURES фич на плитку),
+чтобы первая сборка укладывалась в бюджет на любом железе; при провале
+сборки по бюджету сетка мельчает (до _GRID_MAX_SHRINKS раз) и сборка
+повторяется. Сборка плитки ограничена бюджетом TILE_BUILD_BUDGET_S
+(0.4 с, как в аудите 1.6.1): если плитка всё же не собралась, она
 помечается неудавшейся и ВСЕ запросы по ней идут к слою напрямую —
 неполные результаты никогда не возвращаются. Для пакетных операций
 есть prefetch()/prefetch_async() (фон через QgsTask; потребитель —
@@ -87,6 +91,22 @@ MAX_QUERY_TILES = 1024
 
 # Каждые сколько фич проверяется бюджет времени при сборке плитки.
 _BUDGET_CHECK_EVERY = 32
+
+# Плотностное дробление сетки (см. _ensure_tile_size): seeded-плитка
+# «экстент × 2» на слое из десятков тысяч полигонов не собирается в
+# бюджет (проверено CI: на 10 000 полигонов сборка всей плитки дольше
+# 0,4 с — плитка навсегда _failed, индекс мёртв, всё живёт на прямых
+# запросах). Сетка делится так, чтобы в плитку попадало порядка
+# _TILE_TARGET_FEATURES фич и первая сборка укладывалась в бюджет
+# на любом железе. Для малых слоёв (<= цели) поведение ровно по ТЗ:
+# размер плитки = видимый экстент × tile_factor.
+_TILE_TARGET_FEATURES = 1000
+_TILE_MAX_DIV = 32
+
+# Предохранитель: при провале сборки по бюджету (неоднородная плотность,
+# неправда featureCount) сетка мельчает вдвое — не больше стольких раз
+# за жизнь индекса (иначе ping-pong пересборок съест интерактивность).
+_GRID_MAX_SHRINKS = 5
 
 # Узел индекса: позиция вершины в нормализованной структуре (ТЗ, п. 1)
 # плюс сама точка (для удобства потребителей).
@@ -263,6 +283,8 @@ class TopologyIndex(object):
         self._sigs = []
         self._rm_sig = None
         self._checking = False  # защита от рекурсии check_integrity
+        self._shrinks = 0       # сколько раз сетка мельчала по бюджету
+        self._last_budget_fail = False  # флаг провала по бюджету (для _prepare)
         self._connect(layer)
 
     def seed_extent(self, rect):
@@ -501,16 +523,15 @@ class TopologyIndex(object):
             return
         factor = settings.tile_factor()
         self._tile_factor_used = factor
+        layer = self._layer()
         # приоритет посева (ТЗ этап 3, п. 2: «видимый экстент × 2»):
         # канва (seed_extent_from_iface) -> полный экстент слоя -> сам запрос
         rect = self._seed_rect
-        if rect is None:
-            layer = self._layer()
-            if layer is not None:
-                try:
-                    rect = layer.extent()
-                except Exception:
-                    rect = None
+        if rect is None and layer is not None:
+            try:
+                rect = layer.extent()
+            except Exception:
+                rect = None
         if rect is None:
             rect = seed_rect
         if rect is None:
@@ -523,8 +544,30 @@ class TopologyIndex(object):
                 w = h = 1.0
         w = max(w, 1e-9) * factor
         h = max(h, 1e-9) * factor
-        self._tile_size = (min(max(w, 1e-6), 1e12),
-                           min(max(h, 1e-6), 1e12))
+        # Плотностное дробление: seeded-плитка «экстент × 2» на слое из
+        # десятков тысяч фич не собирается в бюджет (проверено CI на
+        # 10 000 полигонов). Делим сетку, чтобы в плитку попадало
+        # порядка _TILE_TARGET_FEATURES фич: ожидаемое число фич в
+        # seeded-плитке = count × (площадь плитки / площадь экстента).
+        # Малые слои не трогаются — размер ровно по ТЗ.
+        div = 1
+        try:
+            count = int(layer.featureCount())
+        except Exception:
+            count = 0
+        try:
+            ext_area = abs(rect.width() * rect.height()) if rect is not None \
+                else 0.0
+        except Exception:
+            ext_area = 0.0
+        if count > _TILE_TARGET_FEATURES and ext_area > 0.0:
+            per_tile = count * (w * h) / ext_area
+            if per_tile > _TILE_TARGET_FEATURES:
+                div = int(math.ceil(math.sqrt(per_tile /
+                                              _TILE_TARGET_FEATURES)))
+                div = max(1, min(div, _TILE_MAX_DIV))
+        self._tile_size = (min(max(w / div, 1e-6), 1e12),
+                           min(max(h / div, 1e-6), 1e12))
 
     def _tile_keys_covering(self, rect):
         """Ключи плиток, накрывающих rect (сетка привязана к началу
@@ -599,12 +642,15 @@ class TopologyIndex(object):
 
     def _rebuild_tile(self, tk):
         rect = self._tile_rect(tk)
+        self._last_budget_fail = False
         try:
             tile = self._build_tile_data(rect)
         except _BudgetExceeded:
             # ТЗ этап 3, п. 2: бюджет превышен — плитка не строится,
             # запросы по ней идут к слою напрямую (неполные результаты
-            # никогда не возвращаются)
+            # никогда не возвращаются); _prepare мельчит сетку и пробует
+            # снова (см. _shrink_grid)
+            self._last_budget_fail = True
             self._failed[tk] = u"бюджет сборки {:.2f} с превышен".format(
                 TILE_BUILD_BUDGET_S)
             self._tiles.pop(tk, None)
@@ -627,10 +673,40 @@ class TopologyIndex(object):
                 utils.log(u"Индекс [debug]: {}".format(line))
         return True
 
+    def _shrink_grid(self):
+        """Сетка мельчает вдвое после провала сборки по бюджету.
+
+        Второй уровень защиты после плотностного дробления: неоднородная
+        плотность (сгусток фич в одной плитке) или неправда featureCount.
+        Все плитки/пометки сбрасываются: ключи (ix, iy) при новом размере
+        означают другие прямоугольники. Максимум _GRID_MAX_SHRINKS раз за
+        жизнь индекса — иначе ping-pong пересборок съест интерактивность.
+
+        :return: True — сетка уменьшена, _prepare пробует снова."""
+        if self._tile_size is None or self._shrinks >= _GRID_MAX_SHRINKS:
+            return False
+        tw, th = self._tile_size
+        if tw <= 2e-6 or th <= 2e-6:
+            return False
+        self._shrinks += 1
+        self._tile_size = (tw / 2.0, th / 2.0)
+        self._tiles.clear()
+        self._failed.clear()
+        self._dirty.clear()
+        utils.log(u"Индекс: сетка плиток уменьшена вдвое ({}/{}), уже "
+                  u"построенные плитки пересоберутся при обращении"
+                  .format(self._shrinks, _GRID_MAX_SHRINKS))
+        return True
+
     def _prepare(self, rect):
         """Готовит плитки под запрос: строит отсутствующие, пересобирает
         грязные. False — прямоугольник индексом не обслуживается
-        (слишком много плиток) — вызывающий идёт прямым запросом."""
+        (слишком много плиток) — вызывающий идёт прямым запросом.
+
+        Провал сборки по бюджету мельчит сетку (до _GRID_MAX_SHRINKS
+        раз) и пробует снова — плитка с порядком 1000 фич собирается
+        в бюджет на любом железе; при этом НЕУДАВШАЯСЯ (окончательно)
+        плитка не перестраивается на каждый запрос."""
         if self._layer() is None:
             return False
         # смена tile_factor в настройках — пересборка сетки с нуля
@@ -644,15 +720,20 @@ class TopologyIndex(object):
         except Exception:
             pass
         self._ensure_tile_size(rect)
-        keys = self._tile_keys_covering(rect)
-        if keys is None:
-            return False
-        for tk in keys:
-            if tk in self._failed:
-                continue
-            if tk not in self._tiles or tk in self._dirty:
-                if not self._rebuild_tile(tk):
-                    continue  # неудавшаяся — прямой запрос на неё
+        for _attempt in range(_GRID_MAX_SHRINKS + 1):
+            keys = self._tile_keys_covering(rect)
+            if keys is None:
+                return False
+            budget_hit = False
+            for tk in keys:
+                if tk in self._failed:
+                    continue
+                if tk not in self._tiles or tk in self._dirty:
+                    if not self._rebuild_tile(tk) and \
+                            self._last_budget_fail:
+                        budget_hit = True
+            if not budget_hit or not self._shrink_grid():
+                break
         return True
 
     def _has_failed_covering(self, rect):
@@ -688,7 +769,9 @@ class TopologyIndex(object):
         return self._prepare(QgsRectangle(rect))
 
     def nodes_at(self, pt, eps=TOPO_MATCH_EPS):
-        """Вершины в пределах eps от pt: [NodeRef].
+        """Вершины в пределах eps от pt: [NodeRef] (по построенным
+        плиткам; покрытие области проверяет _has_failed_covering —
+        агрегирующие методы при необслуживаемой области вернут None).
 
         Все копии одного топологического узла (смежные фичи, несколько
         колец) возвращаются отдельными NodeRef; сортировка по
@@ -734,7 +817,8 @@ class TopologyIndex(object):
         return _dedup_refs(out)
 
     def edges_near(self, pt, eps=TOPO_MATCH_EPS):
-        """Рёбра в пределах eps от pt: [EdgeRef].
+        """Рёбра в пределах eps от pt: [EdgeRef] (по построенным
+        плиткам; покрытие области проверяет _has_failed_covering).
 
         Кандидаты — QgsSpatialIndex по bbox фичи, повторная проверка —
         по сегментам снимка (point_to_segment <= eps). Рёбра-дубликаты
