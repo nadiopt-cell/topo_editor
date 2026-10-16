@@ -23,17 +23,7 @@ from topopolyedit import settings as tp_settings
 import topopolyedit.topo_editor as te_module
 
 
-@pytest.fixture
-def editor_keep(monkeypatch, stub_iface):
-    """TopoEditor с режимом перехлёстов «оставить» (без диалогов)."""
-    monkeypatch.setattr(
-        te_module.settings, "overlap_mode",
-        lambda: tp_settings.OVERLAP_KEEP)
-
-    def _make(layer):
-        return te_module.TopoEditor(stub_iface, layer)
-
-    return _make
+# фикстура editor_keep — общая, в conftest.py (этап 1)
 
 
 def test_move_shared_node_four_polygons(editor_keep, grid_layer):
@@ -115,25 +105,25 @@ def test_move_node_on_cadastral(editor_keep, cadastral_layer):
 
 
 def test_tjunction_current_behavior_documented(editor_keep, stub_iface):
-    """Документация ТЕКУЩЕГО (до этапа 2) поведения на T-примыкании.
+    """Документация ТЕКУЩЕГО поведения на T-примыкании.
 
-    Вершина B (5,10) лежит на ребре A без узла: перемещение узла B НЕ
-    вставляет вершину в A — известная дыра И4 (этап 2 закроет её
-    автовставкой; этот тест тогда ПЕРЕПИСЫВАЕТСЯ на новую семантику)."""
+    Этап 1: перемещение узла B, ОТРЫВАЮЩЕЕ B от A, блокируется
+    валидатором (новая щель) — раньше щель возникала молча. Дыра И4
+    (автовставка вершины в чужое ребро) остаётся открытой до этапа 2;
+    тогда тест переписывается на новую семантику «узел тянет ребро A».
+    Полная версия проверки — test_validator.py::
+    test_tjunction_tear_now_blocked_by_gap_rule."""
     layer, tags = make_tjunction_layer()
     layer.startEditing()
     try:
         ed = editor_keep(layer)
-        node_b = _pt(25.0, 10.0)  # правый верхний угол B, вне ребра A
+        node_b = _pt(25.0, 10.0)  # правый нижний угол B, вне ребра A
         rep = ed.move_vertex(node_b, _pt(27.0, 12.0))
-        assert not rep.get("error"), rep
-        # A не должен измениться вовсе (его вершины не двигались)
+        assert rep.get("error"), \
+            "этап 1: разъезд T-примыкания блокируется валидатором"
+        # A не изменён (запись не состоялась)
         geom_a = _geom_by_tag(layer, "A")
-        assert _vertex_count(geom_a) == 4, (
-            "A изменился без причины (вершин теперь: {})".format(
-                _vertex_count(geom_a)))
-        # и в A нет вершины в (5,10) — дыра И4, документируем
-        assert not _has_point_as_vertex(geom_a, _pt(5.0, 10.0))
+        assert _vertex_count(geom_a) == 4, "A изменился без причины"
     finally:
         layer.rollBack()
 

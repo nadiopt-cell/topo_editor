@@ -106,9 +106,15 @@ class QgsWkbTypes(object):
 class QgsFeatureRequest(object):
     def __init__(self, rect=None):
         self.rect = rect
+        self.fids = None
 
     def setSubsetOfAttributes(self, names):
         pass
+
+    def setFilterFids(self, fids):
+        """Этап 1: выборка по fid (используется _old_geoms валидатора)."""
+        self.fids = list(fids)
+        return self
 
 
 class QgsProject(object):
@@ -290,6 +296,7 @@ qtcore_mod = types.ModuleType("qgis.PyQt.QtCore")
 class Qt(object):
     class CursorShape(object):
         CrossCursor = 0
+        ForbiddenCursor = 12  # этап 1: курсор при блокирующих нарушениях
 
     class Key(object):
         Key_Escape = 0x01000001
@@ -353,6 +360,37 @@ qtgui_mod.QColor = QColor
 qtwidgets_mod = types.ModuleType("qgis.PyQt.QtWidgets")
 
 
+class QPushButton(object):
+    """Стаб кнопки «Показать место» (этап 1): запоминает создание."""
+
+    CLICKS = []  # [(text, parent)]
+
+    def __init__(self, text, parent=None):
+        self._text = text
+        self._parent = parent
+        self._handlers = []
+        QPushButton.CLICKS.append((text, parent))
+
+    def clicked(self):
+        """Псевдосигнал: connect() запоминает обработчик."""
+        btn = self
+
+        class _Sig(object):
+            def connect(self, handler):
+                btn._handlers.append(handler)
+
+        return _Sig()
+
+    def click(self):
+        for h in self._handlers:
+            h()
+
+
+def _run_pending_clicks():
+    """Тест вручную вызывает обработчики созданных кнопок."""
+    return QPushButton.CLICKS
+
+
 class QMessageBox(object):
     Yes = 1
     No = 0
@@ -363,6 +401,7 @@ class QMessageBox(object):
 
 
 qtwidgets_mod.QMessageBox = QMessageBox
+qtwidgets_mod.QPushButton = QPushButton
 
 
 class QApplication(object):

@@ -26,6 +26,9 @@ from .geo_utils import (
     polys_bbox, points_bbox, contains_vertex, translate_edge_vertices,
     TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
 )
+from .core.validator import (
+    validate_operation, GeosValidity, NoSpikes, Violation, blocking,
+)
 from .snapping_engine import get_snap_layers
 from . import settings
 from . import utils
@@ -133,7 +136,8 @@ def find_overlaps(prepared, neighbors, min_ratio=OVERLAP_MIN_RATIO):
 class TopoEditor(object):
     """Исполнитель топологических операций над редактируемым слоем."""
 
-    def __init__(self, iface, layer, overlap_decider=None):
+    def __init__(self, iface, layer, overlap_decider=None,
+                 makevalid_decider=None):
         """
         :param iface: QgisInterface
         :param layer: редактируемый ПОЛИГОНАЛЬНЫЙ слой (в режиме правки)
@@ -143,10 +147,15 @@ class TopoEditor(object):
             "moved": число перемещаемых, "area": суммарная площадь,
             "overlaps": [...find_overlaps...]}. Без decider в режиме
             «спрашивать» перехлёст остаётся как есть.
+        :param makevalid_decider: callable(info) -> bool; вызывается при
+            невалидной геометрии, если в настройках включено «предлагать
+            исправить через makeValid» (по умолчанию выключено). info =
+            {"fid", "area_before"}. True — применить makeValid и продолжить.
         """
         self.iface = iface
         self.layer = layer
         self.overlap_decider = overlap_decider
+        self.makevalid_decider = makevalid_decider
 
     # ------------------------------------------------------------------
     # Внутренние помощники
@@ -360,6 +369,59 @@ class TopoEditor(object):
             return CHOICE_CANCEL
         return choice if choice in _CHOICES else CHOICE_CANCEL
 
+    def _old_geoms(self, fids):
+        """Текущие (ДО записи) геометрии фич по списку fid.
+
+        Для валидатора: старое состояние затронутых полигонов (щели и
+        общие узлы сравниваются «до/после»).
+
+        :return: {fid: QgsGeometry} (фичи без геометрии пропущены)
+        """
+        out = {}
+        fids = [f for f in fids if f is not None]
+        if not fids:
+            return out
+        req = QgsFeatureRequest()
+        req.setFilterFids(fids)
+        req.setSubsetOfAttributes([])
+        for feat in self.layer.getFeatures(req):
+            g = feat.geometry()
+            if g is None or g.isNull() or g.isEmpty():
+                continue
+            out[feat.id()] = g
+        return out
+
+    def _handle_invalid_geometry(self, g, fid):
+        """Ремонт makeValid по настройке (этап 1: по умолчанию выключен).
+
+        Невалидная геометрия перемещаемого полигона: по умолчанию —
+        блокировка операции (None); при включённой настройке
+        «предлагать исправить через makeValid» и согласии пользователя —
+        отремонтированная геометрия (форма меняется ОТКРЫТО, с диалогом).
+
+        :return: (QgsGeometry | None, repaired: bool)
+        """
+        if not settings.offer_makevalid() or self.makevalid_decider is None:
+            return None, False
+        info = {"fid": fid, "area_before": g.area()}
+        try:
+            approved = self.makevalid_decider(info)
+        except Exception as exc:
+            utils.log(u"makeValid: сбой запроса к пользователю — {}"
+                      .format(exc))
+            return None, False
+        if not approved:
+            return None, False
+        try:
+            gv = g.makeValid()
+        except Exception as exc:
+            utils.log(u"makeValid: сбой — {}".format(exc))
+            return None, False
+        gv = polygon_only(gv)
+        if gv is None or gv.isNull() or gv.isEmpty() or not gv.isGeosValid():
+            return None, False
+        return gv, True
+
     def _fit_to_layer(self, g):
         """Геометрия в виде, допустимом для слоя (одиночная/мульти).
 
@@ -389,26 +451,34 @@ class TopoEditor(object):
     # ------------------------------------------------------------------
 
     def _apply_moves(self, entries, exclude_ids, command_text, eps):
-        """Единый edit-командный блок: запись новых геометрий + отсечение.
+        """Конвейер перемещения: план → валидация → запись (этап 1 ТЗ).
 
         Общий конвейер операций перемещения (узла и ребра):
-          1. новые геометрии: makeValid для невалидных колец, автоотсечение
-             по эталонам ДРУГИХ слоёв (как раньше, без вопросов);
+          1. новые геометрии: автоотсечение по эталонам ДРУГИХ слоёв
+             (как раньше, без вопросов); невалидная геометрия — БЛОКИРОВКА
+             с точками нарушений (makeValid из конвейера убран; ремонт —
+             только по настройке и с подтверждением);
           2. перехлёст с объектами ЭТОГО ЖЕ слоя: обнаружение и — по
-             запросу пользователя — обрезка перемещаемых полигонов, обрезка
-             соседей, «оставить» или отмена всей правки (до записи);
-          3. запись: changeGeometry в одной команде отмены (Ctrl+Z).
+             запросу пользователя — обрезка перемещаемых полигонов,
+             обрезка соседей, «оставить» или отмена всей правки;
+          3. план: все геометрии к записи (перемещаемые + обрезанные
+             соседи) считаются ДО открытия edit-команды;
+          4. валидация плана (все правила этапа 1 по ВСЕМ затронутым
+             полигонам) — при ошибке слой вообще не трогается;
+          5. запись: changeGeometry в одной команде отмены (Ctrl+Z).
 
         :param entries: [{"fid", "polys", "multi"}, ...] — новые геометрии
         :param exclude_ids: {fid, ...} — перемещаемые фичи (не эталоны)
         :param command_text: название edit-команды (видно в истории отмены)
         :param eps: допуск (единицы CRS слоя) — запас габарита
         :return: {"moved", "clipped", "skipped", "refs", "overlaps",
-                  "neighbors_clipped", "overlap_choice", "cancelled"}
+                  "neighbors_clipped", "overlap_choice", "cancelled",
+                  "violations" (dict-список или None), "makevalid_repaired"}
         """
         report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0,
                   "overlaps": 0, "neighbors_clipped": 0,
-                  "overlap_choice": None, "cancelled": False}
+                  "overlap_choice": None, "cancelled": False,
+                  "violations": None, "makevalid_repaired": 0}
 
         # габарит всех новых геометрий + запас
         # (combineExtentWith меняет bbox на месте и возвращает None —
@@ -444,19 +514,21 @@ class TopoEditor(object):
                 report["error"] = u"Перемещаемый полигон без геометрии"
                 return report
             if not g.isGeosValid():
-                try:
-                    gv = g.makeValid()
-                    if not gv.isNull() and not gv.isEmpty() \
-                            and gv.type() == QgsWkbTypes.PolygonGeometry:
-                        g = gv
-                except Exception as exc:
-                    report["error"] = u"Некорректная геометрия #{}: {}".format(
-                        e["fid"], exc)
+                # Этап 1 ТЗ: makeValid из конвейера убран. Невалидная
+                # геометрия — блокировка с точкой нарушения; ремонт —
+                # только по настройке «предлагать makeValid» и с
+                # подтверждением пользователя (по умолчанию выключено).
+                gv, repaired = self._handle_invalid_geometry(g, e["fid"])
+                if gv is None:
+                    violations = GeosValidity().check(e["fid"], g)
+                    report["error"] = (
+                        u"Полигон #{}: самопересечение или иная невалидная "
+                        u"геометрия — операция отменена, слой не изменён"
+                        .format(e["fid"]))
+                    report["violations"] = [v.to_dict() for v in violations]
                     return report
-                if not g.isGeosValid():
-                    report["error"] = u"Некорректная геометрия #{}".format(
-                        e["fid"])
-                    return report
+                g = gv
+                report["makevalid_repaired"] += 1
 
             try:
                 g, clipped_here = self._clip_against_refs(g, refs)
@@ -473,9 +545,18 @@ class TopoEditor(object):
             fitted = self._fit_to_layer(g)
             if fitted is None:
                 report["error"] = (
-                    u"Отсечение полигона #{} дало мультиполигон, слой не "
-                    u"допускает мультигеометрию — операция отменена".format(
+                    u"Полигон #{} состоит из нескольких частей, а слой "
+                    u"объявлен с типом «одиночный полигон» — записать "
+                    u"результат нельзя. Используйте слой типа "
+                    u"MultiPolygon или разберите фичу на части.".format(
                         e["fid"]))
+                return report
+            if not fitted.isGeosValid():
+                violations = GeosValidity().check(e["fid"], fitted)
+                report["error"] = (
+                    u"Отсечение полигона #{} дало невалидную геометрию — "
+                    u"операция отменена, слой не изменён".format(e["fid"]))
+                report["violations"] = [v.to_dict() for v in violations]
                 return report
             prepared.append((e, fitted, clipped_here))
 
@@ -503,13 +584,12 @@ class TopoEditor(object):
             by_neighbor.setdefault(o["neighbor"], []).append(o["moved"])
         neighbor_geom = dict(neighbors)
 
-        # Вся правка одной командой: частичная запись или оставшийся
-        # после сбоя перехлёст недопустимы — при ошибке откатывается всё.
-        command_started = False
+        # --- 3. план: все геометрии к записи (ДО открытия команды) ------
+        # План считается до beginEditCommand: валидатор проверяет
+        # КОНЕЧНОЕ состояние слоя, при блокировке слой не трогается.
+        final = {}          # fid -> QgsGeometry к записи
+        final_clipped = {}  # fid -> счётчик отсечений (для отчёта)
         try:
-            self.layer.beginEditCommand(command_text)
-            command_started = True
-            final = {}
             for e, g, clipped_here in prepared:
                 if choice == CHOICE_CLIP_MOVED and e["fid"] in by_moved:
                     g, more = self._clip_against_refs(
@@ -520,18 +600,13 @@ class TopoEditor(object):
                             u"Отсечение полностью поглотило полигон #{}".format(
                                 e["fid"]))
                 fitted = self._fit_to_layer(g)
-                if fitted is None or not fitted.isGeosValid():
+                if fitted is None:
                     raise RuntimeError(
-                        u"Неподдерживаемая или некорректная геометрия "
-                        u"полигона #{}".format(e["fid"]))
-                if not self.layer.changeGeometry(e["fid"], fitted):
-                    raise RuntimeError(
-                        u"Не удалось записать геометрию #{} (changeGeometry)"
-                        .format(e["fid"]))
-                report["moved"] += 1
-                report["clipped"] += clipped_here
+                        u"Полигон #{} состоит из нескольких частей, а слой "
+                        u"объявлен с типом «одиночный полигон»".format(
+                            e["fid"]))
                 final[e["fid"]] = fitted
-
+                final_clipped[e["fid"]] = clipped_here
             if choice == CHOICE_CLIP_NEIGHBORS:
                 for nfid, mfids in by_neighbor.items():
                     ng = neighbor_geom[nfid]
@@ -548,14 +623,59 @@ class TopoEditor(object):
                     if not cut:
                         continue
                     fitted = self._fit_to_layer(ng)
-                    if fitted is None or not fitted.isGeosValid():
+                    if fitted is None:
                         raise RuntimeError(
-                            u"Неподдерживаемая или некорректная геометрия "
-                            u"соседа #{}".format(nfid))
-                    if not self.layer.changeGeometry(nfid, fitted):
-                        raise RuntimeError(
-                            u"Не удалось записать геометрию соседа #{} "
-                            u"(changeGeometry)".format(nfid))
+                            u"Сосед #{} состоит из нескольких частей, а "
+                            u"слой объявлен с типом «одиночный полигон»"
+                            .format(nfid))
+                    final[nfid] = fitted
+        except RuntimeError as exc:
+            report["error"] = str(exc)
+            return report
+
+        # --- 4. валидация плана: все правила по всем затронутым ---------
+        # (этап 1 ТЗ; при ошибке слой не трогается вовсе)
+        if not neighbors:
+            # KEEP-режим: перехлёстам соседи не понадобились, но щели и
+            # общие узлы проверяются против всего окружения
+            try:
+                neighbors = self._same_layer_neighbors(bbox,
+                                                       set(exclude_ids))
+            except Exception:
+                neighbors = []  # лимит соседей — проверка по затронутым
+        old_geoms = self._old_geoms(set(final.keys()))
+        neighbors_for_validation = [
+            (f, g) for f, g in neighbors if f not in final]
+        violations = validate_operation(
+            old_geoms, final, neighbors_for_validation,
+            overlap_allowed=(choice == CHOICE_KEEP and bool(overlaps)),
+            **settings.validator_opts())
+        errors = blocking(violations)
+        if errors:
+            report["error"] = u"Операция заблокирована валидатором: " + \
+                u"; ".join(v.message for v in errors[:3])
+            if len(errors) > 3:
+                report["error"] += u" (и ещё {})".format(len(errors) - 3)
+            report["violations"] = [v.to_dict() for v in violations]
+            return report
+
+        # --- 5. запись одной командой отмены (Ctrl+Z) --------------------
+        command_started = False
+        try:
+            self.layer.beginEditCommand(command_text)
+            command_started = True
+            write_order = [e["fid"] for e, _g, _c in prepared]
+            write_order += [f for f in sorted(final.keys())
+                            if f not in final_clipped]
+            for fid in write_order:
+                if not self.layer.changeGeometry(fid, final[fid]):
+                    raise RuntimeError(
+                        u"Не удалось записать геометрию #{} (changeGeometry)"
+                        .format(fid))
+                if fid in final_clipped:
+                    report["moved"] += 1
+                    report["clipped"] += final_clipped[fid]
+                else:
                     report["neighbors_clipped"] += 1
             self.layer.endEditCommand()
             command_started = False
@@ -701,9 +821,10 @@ class TopoEditor(object):
         :param p1, p2: концы ребра, по которому выполнен клик (CRS слоя)
         :param new_pt: точка вставки на ребре (CRS слоя)
         :param match_eps: допуск топологического совпадения рёбер (не snap)
-        :return: {"inserted", "features", "error"}
+        :return: {"inserted", "features", "violations", "error"}
         """
-        report = {"inserted": 0, "features": 0, "error": None}
+        report = {"inserted": 0, "features": 0, "violations": None,
+                  "error": None}
         if (new_pt.sqrDist(p1) <= TOPO_MATCH_EPS2 or
                 new_pt.sqrDist(p2) <= TOPO_MATCH_EPS2):
             report["error"] = (u"точка вставки совпадает с вершиной ребра")
@@ -731,6 +852,22 @@ class TopoEditor(object):
                     report["inserted"] += cnt
             if not targets:
                 report["error"] = u"ребро не найдено в полигонах слоя"
+                return report
+
+            # валидация результата (этап 1): геометрия с новым узлом
+            # обязана оставаться валидной (правила по одной геометрии;
+            # вставка коллинеарного узла не создаёт щелей и перехлёстов)
+            new_geoms = {t["fid"]: polys_to_geom(t["polys"], t["multi"])
+                         for t in targets}
+            violations = validate_operation(
+                {}, new_geoms, [], rules=(GeosValidity(), NoSpikes()),
+                **settings.validator_opts())
+            errors = blocking(violations)
+            if errors:
+                report["error"] = (
+                    u"Вставка заблокирована валидатором: " +
+                    u"; ".join(v.message for v in errors[:3]))
+                report["violations"] = [v.to_dict() for v in violations]
                 return report
 
             self.layer.beginEditCommand(u"Вставка узла на ребро")

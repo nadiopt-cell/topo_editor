@@ -78,3 +78,21 @@ def cadastral_layer():
     _editing(layer)
     yield layer, info
     layer.rollBack()
+
+
+@pytest.fixture
+def editor_keep(monkeypatch):
+    """TopoEditor с режимом перехлёстов «оставить» (без диалогов).
+
+    Общая фикстура тестов инструментов и валидатора (этап 1)."""
+    from topopolyedit import settings as tp_settings
+    import topopolyedit.topo_editor as te_module
+
+    monkeypatch.setattr(
+        te_module.settings, "overlap_mode",
+        lambda: tp_settings.OVERLAP_KEEP)
+
+    def _make(layer):
+        return te_module.TopoEditor(stub_iface(), layer)
+
+    return _make

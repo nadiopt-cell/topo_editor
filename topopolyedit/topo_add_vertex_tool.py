@@ -155,9 +155,9 @@ class TopoAddVertexTool(BaseTopoTool):
             map_pt = e.mapPoint()
             seg = None
             layer = None
-            eps = ct_m2l = None
+            eps = ct_m2l = ct_l2m = None
             for lyr in candidates:
-                pt_layer, eps, ct_m2l, _ct_l2m = utils.layer_tolerance(
+                pt_layer, eps, ct_m2l, ct_l2m = utils.layer_tolerance(
                     self.canvas(), lyr, map_pt, kind="edge")
                 s = self._find_segment(lyr, pt_layer, eps)
                 if s is not None:
@@ -178,18 +178,22 @@ class TopoAddVertexTool(BaseTopoTool):
                 src_layer = pt_layer
             proj, _d2, _t = point_to_segment(src_layer, a, b)
 
-            editor = TopoEditor(self.iface, layer)
+            editor = TopoEditor(self.iface, layer, None,
+                                self._ask_makevalid)
             report = editor.add_vertex_on_edge(a, b, proj, TOPO_MATCH_EPS)
-            self._report(report)
+            self._report(report, ct_l2m)
         except Exception as exc:
             self._push_error(exc)
         finally:
             self._cleanup()
 
     # ------------------------------------------------------------------
-    def _report(self, report):
+    def _report(self, report, ct_l2m=None):
         bar = self.iface.messageBar()
         if report.get("error"):
+            if report.get("violations"):
+                self._push_violation_error(report, ct_l2m)
+                return
             bar.pushMessage(u"Топологическое редактирование",
                             u"Вставка не выполнена: {}".format(report["error"]),
                             level=Qgis.Warning, duration=5)

@@ -31,6 +31,12 @@ KEY_DISABLED = SNAP_SECTION + "/snap_disabled_layers"
 KEY_OVERLAP_MODE = SNAP_SECTION + "/same_layer_overlap"
 KEY_SHOW_HINTS = SNAP_SECTION + "/show_snap_hints"
 KEY_AUDIT_ON = SNAP_SECTION + "/node_audit_on"
+# пороги валидатора (ТЗ, «Пороги по умолчанию», этап 1)
+KEY_SPIKE_ANGLE = SNAP_SECTION + "/spike_min_angle_deg"
+KEY_SPIKE_SEVERITY = SNAP_SECTION + "/spike_severity"
+KEY_SEAM_RATIO = SNAP_SECTION + "/seam_min_ratio"
+KEY_SHARED_SEVERITY = SNAP_SECTION + "/shared_boundary_severity"
+KEY_OFFER_MAKEVALID = SNAP_SECTION + "/offer_makevalid"
 
 # Единицы допуска
 UNITS_PX = "px"      # пиксели экрана
@@ -50,6 +56,16 @@ DEFAULT_VERTEX_TOL = 15.0  # узлы (строгий снэп), px
 DEFAULT_OVERLAP_MODE = OVERLAP_ASK
 DEFAULT_SHOW_HINTS = True  # подсвечивать вершины слоёв прилипания
 DEFAULT_AUDIT_ON = False   # режим «Аудит узлов» по умолчанию выключен
+
+# Пороги валидатора (ТЗ этап 1)
+DEFAULT_SPIKE_ANGLE = 0.5            # угол «шипа», градусы
+DEFAULT_SEAM_RATIO = 1e-8            # щель-«шов» стыковки игнорируется
+SEV_ERROR = "error"                  # блокирует запись
+SEV_WARNING = "warning"              # видно в сообщении, не блокирует
+SEVERITIES = (SEV_ERROR, SEV_WARNING)
+DEFAULT_SPIKE_SEVERITY = SEV_WARNING   # шипы — настраиваемо (ТЗ этап 1)
+DEFAULT_SHARED_SEVERITY = SEV_WARNING  # потеря общих узлов
+DEFAULT_OFFER_MAKEVALID = False     # авторемонт makeValid — выкл. (ТЗ 1.6)
 
 # Границы допуска (в любых единицах)
 MIN_TOL = 0.1
@@ -329,6 +345,100 @@ def is_snap_disabled(layer):
         return False
 
 
+# ----------------------------------------------------------------------
+# Пороги валидатора (этап 1 ТЗ): читаются при каждой операции/превью,
+# поэтому — как overlap_mode — только свой ключ.
+# ----------------------------------------------------------------------
+
+def _clamp_severity(value, default):
+    """Только SEV_ERROR / SEV_WARNING; всё прочее -> default."""
+    if value in SEVERITIES:
+        return value
+    return default
+
+
+def spike_min_angle_deg():
+    """Минимальный угол «шипа», градусы (0.5 по умолчанию)."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_SPIKE_ANGLE
+    try:
+        value = float(qs.value(KEY_SPIKE_ANGLE, DEFAULT_SPIKE_ANGLE,
+                               type=float))
+        if value != value or value in (float("inf"), float("-inf")):
+            return DEFAULT_SPIKE_ANGLE
+        return min(max(value, 0.01), 89.0)
+    except Exception:
+        return DEFAULT_SPIKE_ANGLE
+
+
+def spike_severity():
+    """Серьёзность шипов: error (блокирует) или warning (по умолчанию)."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_SPIKE_SEVERITY
+    try:
+        return _clamp_severity(
+            qs.value(KEY_SPIKE_SEVERITY, DEFAULT_SPIKE_SEVERITY, type=str),
+            DEFAULT_SPIKE_SEVERITY)
+    except Exception:
+        return DEFAULT_SPIKE_SEVERITY
+
+
+def seam_min_ratio():
+    """Порог щели-«шва»: доля площади меньшего смежного полигона."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_SEAM_RATIO
+    try:
+        value = float(qs.value(KEY_SEAM_RATIO, DEFAULT_SEAM_RATIO,
+                               type=float))
+        if value != value or value in (float("inf"), float("-inf")):
+            return DEFAULT_SEAM_RATIO
+        return min(max(value, 0.0), 1.0)
+    except Exception:
+        return DEFAULT_SEAM_RATIO
+
+
+def shared_boundary_severity():
+    """Серьёзность потери общих узлов (по умолчанию warning)."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_SHARED_SEVERITY
+    try:
+        return _clamp_severity(
+            qs.value(KEY_SHARED_SEVERITY, DEFAULT_SHARED_SEVERITY,
+                     type=str), DEFAULT_SHARED_SEVERITY)
+    except Exception:
+        return DEFAULT_SHARED_SEVERITY
+
+
+def offer_makevalid():
+    """True — при самопересечении предлагать ремонт makeValid (диалог).
+
+    По умолчанию выключено: makeValid молча меняет форму полигона (ТЗ
+    этап 1: makeValid из конвейера убран)."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_OFFER_MAKEVALID
+    try:
+        return _as_bool(qs.value(KEY_OFFER_MAKEVALID,
+                                 DEFAULT_OFFER_MAKEVALID),
+                        DEFAULT_OFFER_MAKEVALID)
+    except Exception:
+        return DEFAULT_OFFER_MAKEVALID
+
+
+def validator_opts():
+    """Готовый словарь opts для core.validator.validate_operation()."""
+    return {
+        "spike_min_angle_deg": spike_min_angle_deg(),
+        "spike_severity": spike_severity(),
+        "seam_min_ratio": seam_min_ratio(),
+        "shared_severity": shared_boundary_severity(),
+    }
+
+
 def reset_to_defaults():
     """Сбрасывает настройки к значениям по умолчанию.
 
@@ -339,7 +449,9 @@ def reset_to_defaults():
         return False
     try:
         for key in (KEY_EDGE_TOL, KEY_VERTEX_TOL, KEY_UNITS, KEY_DISABLED,
-                    KEY_OVERLAP_MODE, KEY_SHOW_HINTS):
+                    KEY_OVERLAP_MODE, KEY_SHOW_HINTS, KEY_SPIKE_ANGLE,
+                    KEY_SPIKE_SEVERITY, KEY_SEAM_RATIO,
+                    KEY_SHARED_SEVERITY, KEY_OFFER_MAKEVALID):
             try:
                 qs.remove(key)
             except Exception:

@@ -262,10 +262,11 @@ class TopoMoveTool(BaseTopoTool):
             if new_pt.sqrDist(drag["picked"]) <= TOPO_MATCH_EPS2:
                 self._cleanup()
                 return
-            editor = TopoEditor(self.iface, drag["layer"], self._ask_overlap)
+            editor = TopoEditor(self.iface, drag["layer"], self._ask_overlap,
+                                self._ask_makevalid)
             report = editor.move_vertex(
                 drag["picked"], new_pt, drag["match_eps"])
-            self._report(report)
+            self._report(report, drag["ct_l2m"])
         except Exception as exc:
             self._push_error(exc)
         finally:
@@ -325,11 +326,14 @@ class TopoMoveTool(BaseTopoTool):
             except Exception:
                 pass
             rb.setToGeometry(g, None)
-        self._update_overlap_preview(drag["layer"], drag["ct_l2m"], prepared)
+        self._update_validator_preview(drag["layer"], drag["ct_l2m"], prepared)
 
-    def _report(self, report):
+    def _report(self, report, ct_l2m=None):
         bar = self.iface.messageBar()
         if report.get("error"):
+            if report.get("violations"):
+                self._push_violation_error(report, ct_l2m)
+                return
             bar.pushMessage(u"Топологическое редактирование",
                             report["error"], level=Qgis.Warning, duration=4)
             return

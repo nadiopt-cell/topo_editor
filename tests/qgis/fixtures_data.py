@@ -166,3 +166,21 @@ def make_grid_other_crs(nx, ny, cell=0.001, x0=30.0, y0=50.0,
     """
     return make_grid_layer(nx, ny, cell=cell, x0=x0, y0=y0,
                            name=name, crs="EPSG:4326")
+
+
+def make_single_polygon_layer(name="single", crs="EPSG:3857",
+                              wkb="Polygon"):
+    """Одиночный пустой полигональный слой (для произвольных геометрий)."""
+    return _memory_polygon_layer(name, crs, wkb=wkb)
+
+
+def add_polygon_feature(layer, geom, tag="f"):
+    """Добавить фичу с геометрией (и атрибутом id), вернуть fid."""
+    f = QgsFeature(layer.fields())
+    f.setGeometry(geom)
+    f.setAttribute("id", tag)
+    layer.dataProvider().addFeatures([f])
+    for feat in layer.getFeatures():
+        if feat["id"] == tag:
+            return feat.id()
+    raise AssertionError("фича не добавлена")
