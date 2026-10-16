@@ -142,6 +142,17 @@ class SettingsDialog(QDialog):
         self.chk_hints.setChecked(bool(cfg.get("show_hints", True)))
         vis.addWidget(self.chk_hints)
 
+        self.chk_slide = QCheckBox(
+            u"Скользить по соседнему ребру (T-примыкание концом ребра)",
+            grp_vis)
+        self.chk_slide.setToolTip(
+            u"Конец перемещаемого ребра, лежащий на ребре соседа без узла,\n"
+            u"двигается ВДОЛЬ этого ребра вместо параллельного переноса —\n"
+            u"примыкание не рвётся (этап 2). По умолчанию включено.")
+        self.chk_slide.setChecked(bool(cfg.get(
+            "edge_slide", settings.DEFAULT_EDGE_SLIDE)))
+        vis.addWidget(self.chk_slide)
+
         row_ov = QHBoxLayout()
         row_ov.addWidget(QLabel(
             u"Перехлёст с объектами редактируемого слоя:", grp_vis))
@@ -298,6 +309,7 @@ class SettingsDialog(QDialog):
         self.spn_vertex.setValue(settings.DEFAULT_VERTEX_TOL)
         self._set_all_checked(True)
         self.chk_hints.setChecked(settings.DEFAULT_SHOW_HINTS)
+        self.chk_slide.setChecked(settings.DEFAULT_EDGE_SLIDE)
         self._select_overlap(settings.DEFAULT_OVERLAP_MODE)
 
     def current_config(self):
@@ -315,6 +327,7 @@ class SettingsDialog(QDialog):
                              settings.OVERLAP_MODES
                              else settings.DEFAULT_OVERLAP_MODE),
             "show_hints": self.chk_hints.isChecked(),
+            "edge_slide": self.chk_slide.isChecked(),
         }
 
     def apply(self):

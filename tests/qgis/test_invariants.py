@@ -5,13 +5,13 @@
 cancelled — слой битово не изменён), либо assert_topology_ok проходит и
 И3 соблюдён (структура «общий узел -> фичи» сохранена).
 
-XFAIL (strict=False) — оставшаяся дыра:
-- И4: T-примыкания без узла не латываются (сосед не следует) — этап 2.
-  Дыра И1 (молчаливый makeValid) ЗАКРЫТА этапом 1: невалидная
-  геометрия теперь блокирует операцию (допустимая ветвь теста).
-После этапа 2 маркер снимается; XPASS до того — норма.
+Маркер xfail снят (этап 2): дыра И1 (молчаливый makeValid) закрыта
+этапом 1, T-примыкания (И4) латываются конвейером этапа 2 — узел,
+лежащий на чужом ребре, тянет его за собой. Сценарии этой проверки
+(малые сдвиги внутренних узлов сетки) не задевают чужие рёбра;
+целевые T-сценарии — tests/qgis/test_t_junction.py.
 """
-import pytest
+import pytest  # noqa: F401 — запуск только через pytest (см. __main__)
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
@@ -23,11 +23,6 @@ from topology_asserts import (
     shared_pairs_multiset,
     total_area,
 )
-
-pytestmark = pytest.mark.xfail(
-    strict=False,
-    reason="Этап 2 не выполнен: T-примыкания (И4) — см. ТЗ этап 0, "
-           "требование 5. Дыра И1 закрыта этапом 1 (makeValid убран)")
 
 from qgis.core import QgsPointXY  # noqa: E402
 

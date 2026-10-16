@@ -11,6 +11,8 @@
 кривые сегменты сегментируются средствами QGIS.
 """
 
+import math
+
 from qgis.core import QgsPointXY, QgsGeometry, QgsRectangle, QgsWkbTypes
 
 # Порог совпадения точек при дедупликации (в квадрате единиц слоя).
@@ -263,6 +265,126 @@ def collect_matching_points(polys, pt, eps2):
                 seen.append(QgsPointXY(v))
                 out.append(QgsPointXY(v))
     return out
+
+
+# ---------------------------------------------------------------------------
+# T-примыкания (этап 2 ТЗ): узел лежит на чужом ребре без вершины
+# ---------------------------------------------------------------------------
+
+def find_t_edges(polys, pt, eps2):
+    """Рёбра, на которых лежит pt СТРОГО внутри (T-примыкание без узла).
+
+    Ребро (a, b) подходит, если расстояние от pt до ребра не больше
+    sqrt(eps2), а сами концы a и b отстоят от pt ДАЛЬШЕ этого допуска
+    (иначе pt совпадает с вершиной — это не T-примыкание, а общий узел).
+    Рёбра-дубликаты (одна и та же граница в нескольких кольцах фичи)
+    возвращаются один раз: insert_vertex_topo вставит вершину во ВСЕ
+    кольца с этим ребром за один вызов.
+
+    :param polys: нормализованная структура
+    :param pt: QgsPointXY — проверяемая точка
+    :param eps2: квадрат допуска (единицы слоя)
+    :return: [(a, b), ...] — копии координат концов; [] если pt — узел
+             или не лежит ни на одном ребре
+    """
+    out = []
+    seen = []
+    for _pi, _ri, ring in iter_rings(polys):
+        n = len(ring)
+        if n < 4:
+            continue  # минимальное замкнутое кольцо — треугольник
+        for si in range(n - 1):
+            a, b = ring[si], ring[si + 1]
+            if a.sqrDist(b) <= DUP_EPS2:
+                continue  # вырожденный сегмент
+            if a.sqrDist(pt) <= eps2 or b.sqrDist(pt) <= eps2:
+                continue  # конец ребра совпадает с pt — это вершина
+            _proj, d2, _t = point_to_segment(pt, a, b)
+            if d2 > eps2:
+                continue
+            dup = False
+            for sa, sb in seen:
+                if ((sa.sqrDist(a) <= eps2 and sb.sqrDist(b) <= eps2) or
+                        (sa.sqrDist(b) <= eps2 and sb.sqrDist(a) <= eps2)):
+                    dup = True
+                    break
+            if not dup:
+                seen.append((QgsPointXY(a), QgsPointXY(b)))
+                out.append((QgsPointXY(a), QgsPointXY(b)))
+    return out
+
+
+def chain_riders(polys, anchors, eps2):
+    """Вершины-«пассажиры»: лежат на цепочке якорей, но сами не поедут.
+
+    Это чужие T-вершины на перемещаемой цепочке, у которых ОБА соседа
+    по кольцу вне цепочки (иначе это коллинеарный попутчик — его
+    сдвигает translate_edge_vertices по условию «сосед на том же
+    сегменте»). При параллельном переносе цепочки пассажиры остаются
+    на старом месте и отрываются от неё (п. 6 этапа 2 ТЗ: вершина
+    пересчитывается проекцией на новое ребро).
+
+    :param polys: нормализованная структура (ИСХОДНАЯ, до переноса)
+    :param anchors: [QgsPointXY, ...] — вершины цепочки
+    :param eps2: квадрат допуска совпадения
+    :return: [QgsPointXY, ...] — уникальные точки-пассажиры
+    """
+    segs = list(zip(anchors, anchors[1:]))
+    if not segs:
+        return []
+    out = []
+    seen = []
+    for _pi, _ri, ring in iter_rings(polys):
+        n = len(ring)
+        closed = n > 1 and ring[0].sqrDist(ring[-1]) <= DUP_EPS2
+        m = n - 1 if closed else n
+        if m < 3:
+            continue
+        for i in range(m):
+            v = ring[i]
+            if any(v.sqrDist(a) <= eps2 for a in anchors):
+                continue  # якорная копия — поедет с цепочкой сама
+            prev_v = ring[(i - 1) % m]
+            next_v = ring[(i + 1) % m]
+            is_rider = False
+            for a, b in segs:
+                if point_to_segment(v, a, b)[1] > eps2:
+                    continue  # не на этом сегменте цепочки
+                if (point_to_segment(prev_v, a, b)[1] <= eps2 or
+                        point_to_segment(next_v, a, b)[1] <= eps2):
+                    is_rider = False  # попутчик — сдвинется translate'ом
+                else:
+                    is_rider = True   # T-вершина сбоку — пассажир
+                break
+            if not is_rider:
+                continue
+            if any(v.sqrDist(s) <= eps2 for s in seen):
+                continue  # копии той же точки (смежные фичи)
+            seen.append(QgsPointXY(v))
+            out.append(QgsPointXY(v))
+    return out
+
+
+def slide_delta(delta, direction):
+    """Проекция вектора переноса на направление ребра (слайдинг).
+
+    Опция «скользить по соседнему ребру» (этап 2 ТЗ, п. 6): конец
+    цепочки, лежащий на чужом ребре, двигается ВДОЛЬ него — перенос
+    всей цепочки проецируется на направление этого ребра, и T-примы-
+    кание конца сохраняется без разрыва.
+
+    :param delta: (dx, dy) — вектор переноса
+    :param direction: (ux, uy) — направление ребра (любой длины != 0)
+    :return: (dx, dy) — проекция на прямую direction
+    """
+    dx, dy = delta
+    ux, uy = direction
+    ln = math.hypot(ux, uy)
+    if ln <= 1e-12:
+        return delta
+    ux, uy = ux / ln, uy / ln
+    dot = dx * ux + dy * uy
+    return (dot * ux, dot * uy)
 
 
 # ---------------------------------------------------------------------------

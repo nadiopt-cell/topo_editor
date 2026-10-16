@@ -32,6 +32,31 @@ from . import utils
 _MAX_RELATED_MARKERS = 64
 
 
+def _snap_note(snap, edit_layer):
+    """Заметка о прилипании к ребру для строки состояния (этап 2, п. 3).
+
+    Ребро СВОЕГО слоя — вершина будет вставлена в той же операции;
+    ребро ЧУЖОГО слоя — предупреждение «в слое X нет узла»: слой не
+    изменяется, возникнет T-примыкание без общего узла (NoTJunction).
+    Прилипание к узлу — обычный случай, пустая строка.
+    """
+    if snap is None or snap.snap_type != "edge":
+        return u""
+    lyr = snap.layer
+    if lyr is None or edit_layer is None:
+        return u""
+    try:
+        if lyr.id() == edit_layer.id():
+            return (u"узел будет вставлен в ребро своего слоя "
+                    u"(T-залатывание)")
+        state = (u"правка включена" if lyr.isEditable()
+                 else u"слой не в правке")
+        return (u"в слое «{}» нет узла ({}): возникнет T-примыкание "
+                u"без общего узла".format(lyr.name(), state))
+    except Exception:
+        return u""
+
+
 class TopoMoveTool(BaseTopoTool):
     """Перетаскивание общего узла всех смежных полигонов редактируемого слоя."""
 
@@ -241,6 +266,7 @@ class TopoMoveTool(BaseTopoTool):
         try:
             snap = self.engine.snap(map_pt, exclude=self.drag["exclude"],
                                     editable_layer=self.drag["layer"])
+            self._preview_note = _snap_note(snap, self.drag["layer"])
             self._show_snap_feedback(snap)
             self._update_preview(map_pt, snap)
         except Exception as exc:
@@ -344,8 +370,12 @@ class TopoMoveTool(BaseTopoTool):
         if report.get("clipped"):
             parts.append(u"отсечено перехлестов: {}".format(
                 report["clipped"]))
+        if report.get("t_inserted"):
+            parts.append(u"вставлено узлов в рёбра соседей: {}".format(
+                report["t_inserted"]))
         parts.extend(self._overlap_notes(report))
         if report.get("skipped"):
             parts.append(u"пропущено: {}".format(report["skipped"]))
         bar.pushMessage(u"Топологическое редактирование",
                         u"; ".join(parts), level=Qgis.Success, duration=4)
+        self._push_warnings(report)

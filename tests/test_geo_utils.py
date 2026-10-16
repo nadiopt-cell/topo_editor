@@ -1132,7 +1132,8 @@ check("18c load: значения совпадают (новые ключи — 
       st.load_settings() == {"edge_tol": 4.5, "vertex_tol": 6.5,
                              "units": st.UNITS_MAP, "disabled": ["a", "b"],
                              "overlap_mode": st.OVERLAP_ASK,
-                             "show_hints": True})
+                             "show_hints": True,
+                             "edge_slide": True})
 check("18c disabled_layer_ids: множество {'a','b'}",
       st.disabled_layer_ids() == {"a", "b"})
 
@@ -2431,6 +2432,129 @@ ed6 = te.TopoEditor(None, dense_lyr)
 rep_d = ed6.move_vertex(pt(2, 2), pt(3, 3))
 check("30 соседи: больше MAX_OVERLAP_NEIGHBORS — операция отменена",
       rep_d["error"] is not None and rep_d["moved"] == 0)
+
+# ---------------------------------------------------------------------------
+# 31. T-примыкания (этап 2 ТЗ): find_t_edges / chain_riders / slide_delta
+# ---------------------------------------------------------------------------
+
+# A: прямоугольник (0,0)-(20,10); pt строго внутри верхнего ребра
+poly_a = [[ring((0, 0), (20, 0), (20, 10), (0, 10))]]
+t_edges = gu.find_t_edges(poly_a, pt(5, 10), 1e-12)
+check("31 find_t_edges: точка на ребре без вершины найдена",
+      len(t_edges) == 1 and
+      ((t_edges[0][0].x(), t_edges[0][0].y()) in
+       ((0.0, 10.0), (20.0, 10.0))) and
+      ((t_edges[0][1].x(), t_edges[0][1].y()) in
+       ((0.0, 10.0), (20.0, 10.0))))
+check("31 find_t_edges: точка-вершина не T-примыкание",
+      gu.find_t_edges(poly_a, pt(0, 10), 1e-12) == [])
+check("31 find_t_edges: точка вне рёбер — пусто",
+      gu.find_t_edges(poly_a, pt(5, 5), 1e-12) == [])
+check("31 find_t_edges: точка чуть вне ребра за допуском — пусто",
+      gu.find_t_edges(poly_a, pt(5, 10.001), 1e-12) == [])
+
+# дедупликация: одно и то же ребро в двух частях фичи
+poly_dup = [[ring((0, 0), (10, 0), (10, 10), (0, 10)),
+             ring((10, 0), (20, 0), (20, 10), (10, 10))]]
+check("31 find_t_edges: дубликат ребра (две части) вернулся один раз",
+      len(gu.find_t_edges(poly_dup, pt(5, 0), 1e-12)) == 1)
+
+# chain_riders: T-вершина B(5,0) на цепочке A y=0, соседи вне цепочки
+poly_t = [[ring((5, -5), (5, 0), (8, 3), (2, -2))]]
+riders = gu.chain_riders(poly_t, [pt(0, 0), pt(10, 0)], 1e-12)
+check("31 chain_riders: T-вершина сбоку — пассажир",
+      len(riders) == 1 and abs(riders[0].x() - 5.0) < 1e-9 and
+      abs(riders[0].y()) < 1e-9)
+# коллинеарный попутчик (сосед по кольцу на той же цепочке) — НЕ пассажир
+poly_follow = [[ring((0, 0), (5, 0), (10, 0), (10, 5), (0, 5))]]
+check("31 chain_riders: коллинеарный попутчик не пассажир",
+      gu.chain_riders(poly_follow, [pt(0, 0), pt(10, 0)], 1e-12) == [])
+# якорная копия (вершина совпадает с якорем) — не пассажир
+poly_anchor = [[ring((0, 0), (10, 0), (10, 5), (0, 5))]]
+check("31 chain_riders: якорная вершина не пассажир",
+      gu.chain_riders(poly_anchor, [pt(0, 0), pt(10, 0)], 1e-12) == [])
+# вершина на ПРОДОЛЖЕНИИ цепочки за её концом — не пассажир (не на рёбрах)
+poly_line = [[ring((5, 15), (5, 20), (8, 23), (2, 18))]]
+check("31 chain_riders: точка на продолжении цепочки — не пассажир",
+      gu.chain_riders(poly_line, [pt(10, 20), pt(20, 20)], 1e-12) == [])
+# вершина дыры на прямой цепочки, но вне её рёбер — не пассажир
+poly_hole = [[ring((0, 0), (20, 0), (20, 20), (0, 20)),
+              ring((5, 5), (5, 15), (15, 15), (15, 5))]]
+check("31 chain_riders: точка на линии цепочки вне сегментов — не пассажир",
+      gu.chain_riders(poly_hole, [pt(0, 30), pt(20, 30)], 1e-12) == [])
+
+# slide_delta: проекция переноса на направление ребра
+check("31 slide_delta: горизонтальное ребро съедает dy",
+      gu.slide_delta((3, 4), (1, 0)) == (3.0, 0.0))
+check("31 slide_delta: вертикальное ребро съедает dx",
+      gu.slide_delta((3, 4), (0, 2)) == (0.0, 4.0))
+sd = gu.slide_delta((3, 4), (1, 1))
+check("31 slide_delta: диагональ 45° — равные компоненты",
+      abs(sd[0] - 3.5) < 1e-9 and abs(sd[1] - 3.5) < 1e-9)
+check("31 slide_delta: нулевое направление — вектор без изменений",
+      gu.slide_delta((3, 4), (0, 0)) == (3, 4))
+
+# ---------------------------------------------------------------------------
+# 32. Интеграция залатывания (этап 2): T-узел тянет ребро соседа
+# ---------------------------------------------------------------------------
+
+# приёмка этапа 2, тест 1: B имеет вершину на ребре A без пары;
+# после patch+move в A появляется вершина, оба полигона двигаются
+polys_a32 = [[ring((0, 0), (20, 0), (20, 10), (0, 10))]]
+polys_b32 = [[ring((5, 10), (25, 10), (25, 20), (5, 20))]]
+old_pt, new_pt = pt(5, 10), pt(8, 13)
+edges = gu.find_t_edges(polys_a32, old_pt, 1e-12)
+inserted = sum(gu.insert_vertex_topo(polys_a32, a, b, old_pt, 1e-12)
+               for a, b in edges)
+check("32 залатывание: вершина вставлена в ребро A",
+      inserted >= 1 and gu.contains_vertex(polys_a32, old_pt, 1e-12))
+new_a, ch_a = gu.replace_vertices(polys_a32, old_pt, new_pt, 1e-12)
+new_b, ch_b = gu.replace_vertices(polys_b32, old_pt, new_pt, 1e-12)
+# ch_b == 2: замыкающий дубликат кольца заменяется согласованно
+check("32 залатывание: обе фичи обновлены (A и B)",
+      ch_a == 1 and ch_b == 2)
+check("32 залатывание: в A вершина в новом положении узла",
+      gu.contains_vertex(new_a, new_pt, 1e-12))
+check("32 залатывание: в B вершина в новом положении узла",
+      gu.contains_vertex(new_b, new_pt, 1e-12))
+check("32 залатывание: концы ребра A на месте (форма сохранна)",
+      gu.contains_vertex(new_a, pt(0, 10), 1e-12) and
+      gu.contains_vertex(new_a, pt(20, 10), 1e-12))
+
+# приёмка этапа 2, тест 2: ребро с T-концами — якорь на ребре соседа
+# вставляется и уезжает вместе с цепочкой
+polys_a33 = [[ring((0, 0), (30, 0), (30, 20), (0, 20))]]
+polys_b33 = [[ring((10, 20), (20, 20), (20, 30), (10, 30))]]
+anchors33 = [pt(10, 20), pt(20, 20)]
+delta33 = (0.0, 2.0)
+for anc in anchors33:
+    for a, b in gu.find_t_edges(polys_a33, anc, 1e-12):
+        gu.insert_vertex_topo(polys_a33, a, b, anc, 1e-12)
+new_a33, _ch_a33 = gu.translate_edge_vertices(polys_a33, anchors33,
+                                              delta33, 1e-12)
+new_b33, _ch_b33 = gu.translate_edge_vertices(polys_b33, anchors33,
+                                              delta33, 1e-12)
+check("32 T-концы: в A вставлены обе вершины и уехали с цепочкой",
+      gu.contains_vertex(new_a33, pt(10, 22), 1e-12) and
+      gu.contains_vertex(new_a33, pt(20, 22), 1e-12))
+check("32 T-концы: нижнее ребро B уехало вверх",
+      gu.contains_vertex(new_b33, pt(10, 22), 1e-12) and
+      gu.contains_vertex(new_b33, pt(20, 22), 1e-12))
+check("32 T-концы: верх B не тронут",
+      gu.contains_vertex(new_b33, pt(10, 30), 1e-12))
+
+# пассажир: чужая T-вершина НА цепочке (между якорями) следует за ней
+# (кольцо с вершиной (15,20) на ребре y=20, соседи вне цепочки)
+polys_c33 = [[ring((15, 15), (15, 20), (18, 23), (12, 18))]]
+riders33 = gu.chain_riders(polys_c33, anchors33, 1e-12)
+check("32 пассажир: T-вершина найдена на цепочке",
+      len(riders33) == 1 and abs(riders33[0].x() - 15.0) < 1e-9 and
+      abs(riders33[0].y() - 20.0) < 1e-9)
+new_c33, ch_c33 = gu.replace_vertices(
+    polys_c33, riders33[0],
+    pt(riders33[0].x() + delta33[0], riders33[0].y() + delta33[1]), 1e-12)
+check("32 пассажир: вершина переехала на новое ребро",
+      ch_c33 == 1 and gu.contains_vertex(new_c33, pt(15, 22), 1e-12))
 
 # ---------------------------------------------------------------------------
 print("")

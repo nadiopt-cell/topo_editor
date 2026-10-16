@@ -110,6 +110,10 @@ class BaseTopoTool(QgsMapTool):
         self.gap_rb.setWidth(2)
         self._violation_ts = 0.0
         self._forbidden_cursor = False
+        # заметка в строке состояния, не связанная с блокировками
+        # (этап 2: жёлтое предупреждение «в слое X нет узла» и подсказки
+        # T-вставки при прилипании к ребру); сбрасывается в _cleanup()
+        self._preview_note = u""
 
     # ------------------------------------------------------------------
     # Хук подклассов
@@ -204,6 +208,7 @@ class BaseTopoTool(QgsMapTool):
     def _cleanup(self):
         """Полный сброс состояния перетаскивания и визуализации."""
         self.drag = None
+        self._preview_note = u""
         self._reset_poly_rubbers()
         self.snap_marker.hide()
         self._reset_snap_seg()
@@ -414,12 +419,15 @@ class BaseTopoTool(QgsMapTool):
                 except Exception:
                     pass
             # строка состояния + курсор
+            note = self._preview_note
             if errors:
-                self._set_status_message(
-                    u"Топологическое редактирование: " +
-                    u"; ".join(v.message for v in errors[:2]))
+                msg = (u"Топологическое редактирование: " +
+                       u"; ".join(v.message for v in errors[:2]))
+                if note:
+                    msg += u"; " + note
+                self._set_status_message(msg)
             else:
-                self._set_status_message(u"")
+                self._set_status_message(note)
             self._set_forbidden_cursor(bool(errors))
         except Exception as exc:
             utils.log(u"Превью валидатора: сбой — {}".format(exc))
@@ -577,6 +585,30 @@ class BaseTopoTool(QgsMapTool):
             self.TITLE,
             u"Правка отменена: перехлёст с объектами слоя не принят. "
             u"Слой не изменён.", level=Qgis.Info, duration=4)
+
+    def _push_warnings(self, report):
+        """Предупреждения валидатора после успешной записи (этапы 1–2).
+
+        Не блокирующие нарушения (шипы, потеря общих узлов, оставшиеся
+        T-примыкания) показываются отдельным жёлтым сообщением: операция
+        выполнена, но пользователю полезно знать, что осталось.
+        """
+        warnings = report.get("warnings") or []
+        if not warnings:
+            return
+        msgs = []
+        for w in warnings[:3]:
+            text = w.get("message") or u""
+            if text:
+                msgs.append(text)
+        if not msgs:
+            return
+        tail = u"" if len(warnings) <= 3 else \
+            u" (и ещё {})".format(len(warnings) - 3)
+        self.iface.messageBar().pushMessage(
+            self.TITLE, u"Предупреждение: {}{}".format(
+                u"; ".join(msgs), tail),
+            level=Qgis.Warning, duration=6)
 
     # ------------------------------------------------------------------
     # События карты (общие)

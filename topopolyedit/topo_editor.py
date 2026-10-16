@@ -18,16 +18,18 @@
 
 from qgis.core import (
     QgsProject, QgsFeatureRequest, QgsCoordinateTransform, QgsGeometry,
-    QgsRectangle, QgsWkbTypes, Qgis, QgsVectorLayer,
+    QgsRectangle, QgsWkbTypes, Qgis, QgsVectorLayer, QgsPointXY,
 )
 
 from .geo_utils import (
     norm_polys, polys_to_geom, replace_vertices, insert_vertex_topo,
     polys_bbox, points_bbox, contains_vertex, translate_edge_vertices,
+    find_t_edges, chain_riders,
     TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
 )
 from .core.validator import (
     validate_operation, GeosValidity, NoSpikes, Violation, blocking,
+    SEV_WARNING,
 )
 from .snapping_engine import get_snap_layers
 from . import settings
@@ -162,7 +164,18 @@ class TopoEditor(object):
     # ------------------------------------------------------------------
 
     def _collect_moved(self, old_pt, new_pt, match_eps):
-        """Фичи слоя, содержащие вершину old_pt, с подставленной new_pt.
+        """Фичи слоя, задетые перемещением узла old_pt -> new_pt.
+
+        Два случая (этап 2 ТЗ — «залатывание»):
+          * фича содержит ВЕРШИНУ old_pt — вершина заменяется на new_pt;
+          * фича содержит old_pt НА РЕБРЕ без вершины (T-примыкание) —
+            в ребро вставляется вершина в точке old_pt (insert_vertex_topo),
+            и она же заменяется на new_pt: сосед следует за узлом, щель
+            не возникает (приёмка этапа 2: «оба полигона двигаются»).
+        Замена выполняется ОДНИМ проходом replace_vertices после всех
+        вставок: вставленная вершина совпадает с old_pt и уезжает вместе
+        с остальными копиями. Работает для дыр и частей мультиполигонов
+        (insert_vertex_topo обходит все кольца).
 
         match_eps — топологическое совпадение (TOPO_MATCH_EPS), НЕ snap.
 
@@ -180,6 +193,9 @@ class TopoEditor(object):
             if not nr:
                 continue
             polys, was_multi = nr
+            # T-залатывание ДО замены: рёбра, на которых лежит old_pt
+            for a, b in find_t_edges(polys, old_pt, eps2):
+                insert_vertex_topo(polys, a, b, old_pt, eps2)
             new_polys, changed = replace_vertices(polys, old_pt, new_pt, eps2)
             if changed:
                 entries.append({"fid": feat.id(), "polys": new_polys,
@@ -450,8 +466,9 @@ class TopoEditor(object):
     # Общий конвейер перемещения
     # ------------------------------------------------------------------
 
-    def _apply_moves(self, entries, exclude_ids, command_text, eps):
-        """Конвейер перемещения: план → валидация → запись (этап 1 ТЗ).
+    def _apply_moves(self, entries, exclude_ids, command_text, eps,
+                     t_points=None):
+        """Конвейер перемещения: план → валидация → запись (этапы 1–2 ТЗ).
 
         Общий конвейер операций перемещения (узла и ребра):
           1. новые геометрии: автоотсечение по эталонам ДРУГИХ слоёв
@@ -463,7 +480,10 @@ class TopoEditor(object):
              обрезка соседей, «оставить» или отмена всей правки;
           3. план: все геометрии к записи (перемещаемые + обрезанные
              соседи) считаются ДО открытия edit-команды;
-          4. валидация плана (все правила этапа 1 по ВСЕМ затронутым
+          3б. T-залатывание по НОВЫМ позициям (этап 2, п. 3): узел,
+             прилипший к ребру своего слоя, получает в этом ребре
+             вершину — в той же операции;
+          4. валидация плана (все правила этапов 1–2 по ВСЕМ затронутым
              полигонам) — при ошибке слой вообще не трогается;
           5. запись: changeGeometry в одной команде отмены (Ctrl+Z).
 
@@ -471,14 +491,20 @@ class TopoEditor(object):
         :param exclude_ids: {fid, ...} — перемещаемые фичи (не эталоны)
         :param command_text: название edit-команды (видно в истории отмены)
         :param eps: допуск (единицы CRS слоя) — запас габарита
+        :param t_points: [QgsPointXY, ...] новые позиции перемещённых
+                         узлов/якорей — для T-залатывания (этап 2) и
+                         правила NoTJunction
         :return: {"moved", "clipped", "skipped", "refs", "overlaps",
                   "neighbors_clipped", "overlap_choice", "cancelled",
-                  "violations" (dict-список или None), "makevalid_repaired"}
+                  "t_inserted", "violations" (dict-список или None),
+                  "warnings" (dict-список предупреждений или None),
+                  "makevalid_repaired"}
         """
         report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0,
                   "overlaps": 0, "neighbors_clipped": 0,
                   "overlap_choice": None, "cancelled": False,
-                  "violations": None, "makevalid_repaired": 0}
+                  "t_inserted": 0, "violations": None, "warnings": None,
+                  "makevalid_repaired": 0}
 
         # габарит всех новых геометрий + запас
         # (combineExtentWith меняет bbox на месте и возвращает None —
@@ -633,6 +659,22 @@ class TopoEditor(object):
             report["error"] = str(exc)
             return report
 
+        # --- 3б. T-залатывание по НОВЫМ позициям (этап 2 ТЗ, п. 3) ------
+        # Узел прилип к ребру СВОЕГО слоя: в это ребро вставляется
+        # вершина в той же операции. Выполняется ПОСЛЕ решения о
+        # перехлёсте: обрезанные соседи уже в плане и не дублируются.
+        t_fids = set()
+        if t_points:
+            try:
+                t_entries = self._t_patch_at_points(t_points,
+                                                    set(final.keys()), eps)
+            except Exception as exc:
+                report["error"] = u"T-залатывание: сбой — {}".format(exc)
+                return report
+            for t in t_entries:
+                final[t["fid"]] = polys_to_geom(t["polys"], t["multi"])
+                t_fids.add(t["fid"])
+
         # --- 4. валидация плана: все правила по всем затронутым ---------
         # (этап 1 ТЗ; при ошибке слой не трогается вовсе)
         if not neighbors:
@@ -649,6 +691,7 @@ class TopoEditor(object):
         violations = validate_operation(
             old_geoms, final, neighbors_for_validation,
             overlap_allowed=(choice == CHOICE_KEEP and bool(overlaps)),
+            moved_points=list(t_points or []),
             **settings.validator_opts())
         errors = blocking(violations)
         if errors:
@@ -658,6 +701,11 @@ class TopoEditor(object):
                 report["error"] += u" (и ещё {})".format(len(errors) - 3)
             report["violations"] = [v.to_dict() for v in violations]
             return report
+        warnings = [v for v in violations if v.severity == SEV_WARNING]
+        if warnings:
+            report["warnings"] = [v.to_dict() for v in warnings]
+            utils.log(u"Валидатор: предупреждения — {}".format(
+                u"; ".join(v.message for v in warnings[:5])))
 
         # --- 5. запись одной командой отмены (Ctrl+Z) --------------------
         command_started = False
@@ -675,6 +723,8 @@ class TopoEditor(object):
                 if fid in final_clipped:
                     report["moved"] += 1
                     report["clipped"] += final_clipped[fid]
+                elif fid in t_fids:
+                    report["t_inserted"] += 1  # T-залатывание (этап 2)
                 else:
                     report["neighbors_clipped"] += 1
             self.layer.endEditCommand()
@@ -704,7 +754,8 @@ class TopoEditor(object):
         :param new_pt: новое положение узла (CRS слоя), уже с прилипанием
         :param match_eps: допуск топологического совпадения узла
                           (TOPO_MATCH_EPS; НЕ snap-допуск)
-        :return: {"moved", "clipped", "skipped", "refs", "error"}
+        :return: {"moved", "clipped", "skipped", "refs", "t_inserted",
+                  "warnings", "error"}
         """
         report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0,
                   "error": None}
@@ -718,7 +769,8 @@ class TopoEditor(object):
                 return report
             report.update(self._apply_moves(
                 entries, {e["fid"] for e in entries},
-                u"Топологическое перемещение узла", match_eps))
+                u"Топологическое перемещение узла", match_eps,
+                t_points=[QgsPointXY(new_pt)]))
         except Exception as exc:
             try:
                 self.layer.destroyEditCommand()
@@ -732,12 +784,20 @@ class TopoEditor(object):
     # ------------------------------------------------------------------
 
     def _collect_edge_moved(self, anchors, delta, match_eps=TOPO_MATCH_EPS):
-        """Фичи слоя, содержащие хотя бы одну якорную вершину цепочки,
-        с якорями, сдвинутыми на вектор delta.
+        """Фичи слоя, задетые переносом цепочки якорей на вектор delta.
 
-        Полигон, содержащий только часть якорей (примыкание "только
-        концом", как полигон C на вершине общего ребра A и B),
-        смещается этими якорями — топология сохраняется.
+        Три случая (этап 2 ТЗ):
+          * фича содержит якорную вершину — якоря и коллинеарные
+            попутчики сдвигаются (translate_edge_vertices);
+          * фича содержит якорь НА СВОЁМ ребре без вершины (T-конец
+            цепочки, п. 1–2) — в ребро вставляется вершина в точке
+            якоря; она совпадает с якорем и уезжает вместе с цепочкой;
+          * фича содержит вершину-пассажира НА цепочке (чужая T-вершина
+            на перемещаемом ребре, п. 6) — она сдвигается на delta
+            (при параллельном переносе проекция на новое ребро — это
+            и есть сдвиг на delta) и остаётся на новом ребре.
+        Полигон, содержащий только часть якорей (примыкание «только
+        концом»), смещается этими якорями — топология сохраняется.
 
         :param anchors: [QgsPointXY, ...] — исходные вершины цепочки
         :param delta: (dx, dy) — вектор переноса (CRS слоя)
@@ -759,10 +819,62 @@ class TopoEditor(object):
             if not nr:
                 continue
             polys, was_multi = nr
+            # 1) T-залатывание ДО переноса: якорь на ребре фичи без узла
+            for anchor in anchors:
+                for a, b in find_t_edges(polys, anchor, eps2):
+                    insert_vertex_topo(polys, a, b, anchor, eps2)
+            # 2) якоря + коллинеарные попутчики общей границы
             new_polys, changed = translate_edge_vertices(
                 polys, anchors, delta, eps2)
+            # 3) вершины-пассажиры: чужие T-вершины на цепочке
+            for old_r in chain_riders(polys, anchors, eps2):
+                new_polys, ch2 = replace_vertices(
+                    new_polys, old_r,
+                    QgsPointXY(old_r.x() + dx, old_r.y() + dy), eps2)
+                changed += ch2
             if changed:
                 entries.append({"fid": feat.id(), "polys": new_polys,
+                                "multi": was_multi})
+        return entries
+
+    def _t_patch_at_points(self, pts, exclude_ids,
+                           match_eps=TOPO_MATCH_EPS):
+        """Вставка вершин в рёбра СВОЕГО слоя под точками pts (п. 3).
+
+        Новая позиция перемещённого узла легла на ребро соседа без
+        вершины (прилипание к ребру своего слоя): в это ребро вставляется
+        вершина В ТОЙ ЖЕ операции — иначе узел остаётся T-примыканием
+        без общего узла (И4). Фичи из exclude_ids (уже в плане) не
+        дублируются: их геометрия перезаписывается целиком, а узел на
+        ребре САМОЙ перемещаемой фичи — самокасание, его отсекает
+        валидатор (GeosValidity).
+
+        :param pts: [QgsPointXY, ...] — новые позиции узлов/якорей
+        :param exclude_ids: {fid, ...} — фичи, уже вошедшие в план
+        :param match_eps: допуск топологического совпадения (не snap)
+        :return: [{"fid", "polys", "multi"}, ...] — патчи к плану
+        """
+        eps2 = match_eps * match_eps
+        rect = points_bbox(pts)
+        if rect is None:
+            return []
+        rect.grow(match_eps * 2.0)
+        entries = []
+        req = QgsFeatureRequest(rect)
+        req.setSubsetOfAttributes([])
+        for feat in self.layer.getFeatures(req):
+            if feat.id() in exclude_ids:
+                continue
+            nr = norm_polys(feat.geometry())
+            if not nr:
+                continue
+            polys, was_multi = nr
+            changed = 0
+            for pt in pts:
+                for a, b in find_t_edges(polys, pt, eps2):
+                    changed += insert_vertex_topo(polys, a, b, pt, eps2)
+            if changed:
+                entries.append({"fid": feat.id(), "polys": polys,
                                 "multi": was_multi})
         return entries
 
@@ -780,7 +892,8 @@ class TopoEditor(object):
         :param delta: (dx, dy) — вектор переноса (CRS слоя),
                       уже с прилипанием
         :param match_eps: допуск топологического совпадения (не snap)
-        :return: {"moved", "clipped", "skipped", "refs", "error"}
+        :return: {"moved", "clipped", "skipped", "refs", "t_inserted",
+                  "warnings", "error"}
         """
         report = {"moved": 0, "clipped": 0, "skipped": 0, "refs": 0,
                   "error": None}
@@ -801,7 +914,9 @@ class TopoEditor(object):
                 return report
             report.update(self._apply_moves(
                 entries, {e["fid"] for e in entries},
-                u"Топологическое перемещение ребра", match_eps))
+                u"Топологическое перемещение ребра", match_eps,
+                t_points=[QgsPointXY(a.x() + dx, a.y() + dy)
+                          for a in anchors]))
         except Exception as exc:
             try:
                 self.layer.destroyEditCommand()

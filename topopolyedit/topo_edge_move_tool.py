@@ -18,6 +18,8 @@
   * Esc — отмена перетаскивания / выход из инструмента.
 """
 
+import math
+
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.gui import QgsVertexMarker, QgsRubberBand
@@ -26,11 +28,14 @@ from qgis.core import (QgsPointXY, QgsRectangle, QgsGeometry, QgsWkbTypes,
 
 from .geo_utils import (norm_polys, polys_to_geom, collinear_run,
                         translate_edge_vertices, find_segment, contains_vertex,
-                        points_bbox, TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
+                        points_bbox, slide_delta,
+                        TOPO_MATCH_EPS, TOPO_MATCH_EPS2,
                         COLLINEAR_EPS2)
 from .snapping_engine import get_snap_layers
 from .topo_editor import TopoEditor
 from .topo_tool_base import BaseTopoTool
+from .topo_move_tool import _snap_note
+from . import settings
 from . import utils
 
 
@@ -155,6 +160,11 @@ class TopoEdgeMoveTool(BaseTopoTool):
         требует наименьшего сдвига. Перенос остаётся параллельным:
         форма ребра не искажается.
 
+        Слайдинг (этап 2, п. 6): если прилипания нет, но конец цепочки
+        лежит на чужом ребре своего слоя, перенос проецируется на
+        направление этого ребра — конец скользит ВДОЛЬ ребра и
+        примыкание не рвётся.
+
         :return: (SnapResult или None, (dx, dy) — итоговый вектор)
         """
         drag = self.drag
@@ -176,6 +186,9 @@ class TopoEdgeMoveTool(BaseTopoTool):
             if best is None or dist2 < best[0]:
                 best = (dist2, snap, (vx, vy))
         if best is None:
+            dirs = drag.get("slide_dirs") or []
+            if dirs:
+                return None, slide_delta((dx, dy), dirs[0])
             return None, (dx, dy)
         _d2, snap, (vx, vy) = best
         return snap, (dx + vx, dy + vy)
@@ -191,6 +204,90 @@ class TopoEdgeMoveTool(BaseTopoTool):
                     cur.y() - drag["press_layer"].y())
         except Exception:
             return d_map
+
+    # ------------------------------------------------------------------
+    # Слайдинг по соседнему ребру (этап 2 ТЗ, п. 6)
+    # ------------------------------------------------------------------
+
+    def _foreign_edge_under(self, layer, anchor, exclude_fids, eps2):
+        """Чужое ребро СВОЕГО слоя строго под концом цепочки (T-конец).
+
+        Конец якорной цепочки лежит на ребре соседа БЕЗ вершины —
+        при параллельном переносе примыкание рвётся; направление этого
+        ребра используется для слайдинга.
+
+        :return: (a, b) QgsPointXY (CRS слоя) или None
+        """
+        rect = QgsRectangle(anchor.x() - math.sqrt(eps2),
+                            anchor.y() - math.sqrt(eps2),
+                            anchor.x() + math.sqrt(eps2),
+                            anchor.y() + math.sqrt(eps2))
+        rect.grow(math.sqrt(eps2))
+        best = None
+        req = QgsFeatureRequest(rect)
+        req.setSubsetOfAttributes([])
+        for feat in layer.getFeatures(req):
+            if feat.id() in exclude_fids:
+                continue
+            nr = norm_polys(feat.geometry())
+            if not nr:
+                continue
+            r = find_segment(nr[0], anchor, eps2)
+            if r is None:
+                continue
+            _pi, _ri, _si, a, b, _proj, d2 = r
+            if a.sqrDist(anchor) <= eps2 or b.sqrDist(anchor) <= eps2:
+                continue  # совпадает с вершиной соседа — это общий узел
+            if best is None or d2 < best[2]:
+                best = (a, b, d2)
+        if best is None:
+            return None
+        return best[0], best[1]
+
+    def _slide_directions(self, layer, anchors, entries, ct_l2m, match_eps):
+        """Направления слайдинга (CRS карты) для концов цепочки.
+
+        Для каждого конца цепочки ищется чужое ребро своего слоя строго
+        под ним (T-примыкание концом). Если оба конца лежат на рёбрах
+        ОДНОГО направления (параллельные рёбра) — слайдинг возможен;
+        конфликтующие направления или выключенная настройка — пустой
+        список (обычный параллельный перенос; залатывание сделает
+        конвейер).
+
+        :return: [(ux, uy), ...] — не больше одного направления
+        """
+        if not settings.edge_slide_on_neighbors():
+            return []
+        exclude = {en["fid"] for en in entries}
+        eps2 = match_eps * match_eps
+        dirs = []
+        for anchor in (anchors[0], anchors[-1]):
+            edge = self._foreign_edge_under(layer, anchor, exclude, eps2)
+            if edge is None:
+                continue
+            a, b = edge
+            dx = b.x() - a.x()
+            dy = b.y() - a.y()
+            ln = math.hypot(dx, dy)
+            if ln <= 1e-12:
+                continue
+            try:
+                am = ct_l2m.transform(QgsPointXY(a))
+                bm = ct_l2m.transform(QgsPointXY(b))
+            except Exception:
+                continue
+            mdx = bm.x() - am.x()
+            mdy = bm.y() - am.y()
+            mln = math.hypot(mdx, mdy)
+            if mln <= 1e-12:
+                continue
+            dirs.append((mdx / mln, mdy / mln))
+        if len(dirs) > 1:
+            # конфликт направлений — параллельный перенос невозможен
+            for u in dirs[1:]:
+                if abs(u[0] * dirs[0][0] + u[1] * dirs[0][1]) < 0.999:
+                    return []
+        return dirs[:1]
 
     # ------------------------------------------------------------------
     # События карты
@@ -273,6 +370,14 @@ class TopoEdgeMoveTool(BaseTopoTool):
                 "entries": entries,
                 "exclude": {(layer.id(), en["fid"]) for en in entries},
             }
+            # слайдинг: направления чужих рёбер под концами цепочки
+            try:
+                self.drag["slide_dirs"] = self._slide_directions(
+                    layer, anchors, entries, ct_l2m, TOPO_MATCH_EPS)
+            except Exception as exc:
+                utils.log(u"Слайдинг: сбой поиска чужого ребра — {}"
+                          .format(exc))
+                self.drag["slide_dirs"] = []
             self._hide_hover()
             for _ in entries:
                 self._make_polygon_rubber()
@@ -291,6 +396,7 @@ class TopoEdgeMoveTool(BaseTopoTool):
             return
         try:
             snap, d_map = self._translation_delta(map_pt)
+            self._preview_note = _snap_note(snap, self.drag["layer"])
             self._show_snap_feedback(snap)
             self._update_preview(d_map)
         except Exception as exc:
@@ -391,12 +497,16 @@ class TopoEdgeMoveTool(BaseTopoTool):
                 report["moved"])
             if report.get("clipped"):
                 msg += u"; перехлестов отсечено: {}".format(report["clipped"])
+            if report.get("t_inserted"):
+                msg += u"; вставлено узлов в рёбра соседей: {}".format(
+                    report["t_inserted"])
             for note in self._overlap_notes(report):
                 msg += u"; " + note
             if report.get("skipped"):
                 msg += u"; пропущено: {}".format(report["skipped"])
             bar.pushMessage(u"Топологическое редактирование", msg,
                             level=Qgis.Success, duration=4)
+            self._push_warnings(report)
         else:
             bar.pushMessage(u"Топологическое редактирование",
                             u"Изменений не выполнено",

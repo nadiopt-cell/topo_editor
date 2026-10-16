@@ -37,6 +37,7 @@ KEY_SPIKE_SEVERITY = SNAP_SECTION + "/spike_severity"
 KEY_SEAM_RATIO = SNAP_SECTION + "/seam_min_ratio"
 KEY_SHARED_SEVERITY = SNAP_SECTION + "/shared_boundary_severity"
 KEY_OFFER_MAKEVALID = SNAP_SECTION + "/offer_makevalid"
+KEY_EDGE_SLIDE = SNAP_SECTION + "/edge_slide_on_neighbors"
 
 # Единицы допуска
 UNITS_PX = "px"      # пиксели экрана
@@ -66,6 +67,7 @@ SEVERITIES = (SEV_ERROR, SEV_WARNING)
 DEFAULT_SPIKE_SEVERITY = SEV_WARNING   # шипы — настраиваемо (ТЗ этап 1)
 DEFAULT_SHARED_SEVERITY = SEV_WARNING  # потеря общих узлов
 DEFAULT_OFFER_MAKEVALID = False     # авторемонт makeValid — выкл. (ТЗ 1.6)
+DEFAULT_EDGE_SLIDE = True   # скользить по соседнему ребру (ТЗ этап 2)
 
 # Границы допуска (в любых единицах)
 MIN_TOL = 0.1
@@ -154,7 +156,8 @@ def load_settings():
     """Читает настройки; возвращает словарь с гарантированно годными полями:
       {"edge_tol": float, "vertex_tol": float,
        "units": "px"|"map", "disabled": [str, ...],
-       "overlap_mode": "ask"|"clip"|"keep", "show_hints": bool}
+       "overlap_mode": "ask"|"clip"|"keep", "show_hints": bool,
+       "edge_slide": bool}
     """
     cfg = {
         "edge_tol": DEFAULT_EDGE_TOL,
@@ -163,6 +166,7 @@ def load_settings():
         "disabled": [],
         "overlap_mode": DEFAULT_OVERLAP_MODE,
         "show_hints": DEFAULT_SHOW_HINTS,
+        "edge_slide": DEFAULT_EDGE_SLIDE,
     }
     qs = _qsettings()
     if qs is None:
@@ -199,6 +203,11 @@ def load_settings():
             qs.value(KEY_SHOW_HINTS, DEFAULT_SHOW_HINTS), DEFAULT_SHOW_HINTS)
     except Exception:
         pass
+    try:
+        cfg["edge_slide"] = _as_bool(
+            qs.value(KEY_EDGE_SLIDE, DEFAULT_EDGE_SLIDE), DEFAULT_EDGE_SLIDE)
+    except Exception:
+        pass
     return cfg
 
 
@@ -233,6 +242,8 @@ def save_settings(cfg):
             cfg.get("overlap_mode", DEFAULT_OVERLAP_MODE)))
         qs.setValue(KEY_SHOW_HINTS, _as_bool(
             cfg.get("show_hints", DEFAULT_SHOW_HINTS), DEFAULT_SHOW_HINTS))
+        qs.setValue(KEY_EDGE_SLIDE, _as_bool(
+            cfg.get("edge_slide", DEFAULT_EDGE_SLIDE), DEFAULT_EDGE_SLIDE))
         return True
     except Exception:
         return False
@@ -429,6 +440,22 @@ def offer_makevalid():
         return DEFAULT_OFFER_MAKEVALID
 
 
+def edge_slide_on_neighbors():
+    """True — «скользить по соседнему ребру» (этап 2 ТЗ, п. 6).
+
+    Конец перемещаемой цепочки, лежащий на чужом ребре, двигается
+    ВДОЛЬ этого ребра (перенос проецируется на его направление)
+    вместо параллельного переноса. По умолчанию включено."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_EDGE_SLIDE
+    try:
+        return _as_bool(qs.value(KEY_EDGE_SLIDE, DEFAULT_EDGE_SLIDE),
+                        DEFAULT_EDGE_SLIDE)
+    except Exception:
+        return DEFAULT_EDGE_SLIDE
+
+
 def validator_opts():
     """Готовый словарь opts для core.validator.validate_operation()."""
     return {
@@ -451,7 +478,8 @@ def reset_to_defaults():
         for key in (KEY_EDGE_TOL, KEY_VERTEX_TOL, KEY_UNITS, KEY_DISABLED,
                     KEY_OVERLAP_MODE, KEY_SHOW_HINTS, KEY_SPIKE_ANGLE,
                     KEY_SPIKE_SEVERITY, KEY_SEAM_RATIO,
-                    KEY_SHARED_SEVERITY, KEY_OFFER_MAKEVALID):
+                    KEY_SHARED_SEVERITY, KEY_OFFER_MAKEVALID,
+                    KEY_EDGE_SLIDE):
             try:
                 qs.remove(key)
             except Exception:

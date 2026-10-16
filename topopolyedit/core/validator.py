@@ -15,6 +15,11 @@ Violation. Оркестратор validate_operation() прогоняет пра
 makeValid из конвейера записи убран (этап 1): невалидная геометрия —
 ошибка с точкой места нарушения, а не тихая починка формы.
 
+Этап 2 добавляет правило NoTJunction (И4): перемещённый узел, оставшийся
+на чужом ребре без вершины, — предупреждение (залатывание выполняет
+конвейер topo_editor ДО/ПОСЛЕ записи; правило — страховка и контроль
+слоёв вне правки).
+
 Модуль зависит только от qgis.core — без qgis.gui (тесты, будущие
 операции, серверное использование).
 """
@@ -23,6 +28,8 @@ import math
 from collections import defaultdict
 
 from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
+
+from ..geo_utils import norm_polys, find_t_edges, TOPO_MATCH_EPS
 
 # --- уровни серьёзности -------------------------------------------------
 
@@ -38,6 +45,7 @@ CODE_DUP_VERTEX = u"dup_vertex"                # две подряд совпа�
 CODE_OVERLAP = u"same_layer_overlap"           # перехлёст с соседом слоя
 CODE_NEW_GAP = u"new_gap"                      # новая щель
 CODE_SHARED_BOUNDARY = u"shared_boundary_lost" # общий узел потерян
+CODE_T_JUNCTION = u"t_junction_no_node"        # узел на чужом ребре без вершины
 
 # --- пороги по умолчанию (ТЗ, «Пороги по умолчанию»; переопределяются
 #     в QgsSettings через topopolyedit.settings) --------------------------
@@ -48,6 +56,7 @@ DEFAULT_SPIKE_MIN_ANGLE_DEG = 0.5
 DEFAULT_SPIKE_SEVERITY = SEV_WARNING
 DEFAULT_SHARED_SEVERITY = SEV_WARNING
 DEFAULT_NDIGITS = 6  # округление узлов при сравнении «узел -> фичи»
+DEFAULT_T_JUNCTION_SEVERITY = SEV_WARNING  # И4 вне слоёв правки (этап 2)
 
 
 class Violation(object):
@@ -387,14 +396,63 @@ class SharedBoundaryPreserved(object):
         return out
 
 
+class NoTJunction(object):
+    """И4 (этап 2 ТЗ, п. 5): после операции каждый перемещённый узел,
+    лежащий на ЧУЖОМ ребре без вершины, либо вставлен в это ребро,
+    либо даёт предупреждение (серьёзность warning — гарантия топологии
+    только для слоёв в правке; см. ТЗ, инвариант И4).
+
+    «Чужие» рёбра — у соседей из ctx["neighbors"]: фичи, вошедшие в
+    план (залатанные конвейером), лежат в new_geoms и соседями не
+    являются — вставка в них уже выполнена. Узел, совпадающий с
+    ВЕРШИНОЙ соседа, нарушением не считается (это общий узел).
+
+    ctx["moved_points"] — [QgsPointXY, ...] новые позиции перемещённых
+    узлов/якорей (передаёт _apply_moves)."""
+
+    NAME = u"T-примыкания"
+
+    def check(self, ctx):
+        moved_points = ctx.get("moved_points") or []
+        neighbors = ctx.get("neighbors") or []
+        if not moved_points or not neighbors:
+            return []
+        eps = ctx.get("t_junction_eps", TOPO_MATCH_EPS)
+        eps2 = eps * eps
+        severity = ctx.get("t_junction_severity",
+                           DEFAULT_T_JUNCTION_SEVERITY)
+        out = []
+        for pt in moved_points:
+            if pt is None:
+                continue
+            for fid, g in neighbors:
+                if g is None or g.isNull() or g.isEmpty():
+                    continue
+                try:
+                    nr = norm_polys(g)
+                except Exception:
+                    continue
+                if not nr:
+                    continue
+                if find_t_edges(nr[0], pt, eps2):
+                    out.append(Violation(
+                        CODE_T_JUNCTION, severity, fid,
+                        u"узел ({:.6g}, {:.6g}) остался на ребре фичи #{} "
+                        u"без вершины — T-примыкание без общего узла"
+                        .format(pt.x(), pt.y(), fid),
+                        point=QgsPointXY(pt)))
+                    break  # одно предупреждение на узел
+        return out
+
+
 # -----------------------------------------------------------------------
 # Оркестратор
 # -----------------------------------------------------------------------
 
 def default_rules():
-    """Набор правил этапа 1 (все пять из ТЗ)."""
+    """Набор правил этапов 1–2 (все из ТЗ)."""
     return (GeosValidity(), NoSpikes(), NoSameLayerOverlap(),
-            NoNewGaps(), SharedBoundaryPreserved())
+            NoNewGaps(), SharedBoundaryPreserved(), NoTJunction())
 
 
 def validate_operation(old_geoms, new_geoms, neighbors, rules=None, **opts):
