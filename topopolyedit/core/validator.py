@@ -115,11 +115,22 @@ class GeosValidity(object):
             return []
         out = []
         for err in errs or []:
+            # привязка QgsGeometry.Error зависит от версии SIP: сообщение
+            # может быть методом, атрибутом или только в str(err)
             msg = u""
-            f = getattr(err, "message", None)
-            if callable(f):
+            for attr in ("message", "what"):
+                f = getattr(err, attr, None)
+                if f is None:
+                    continue
                 try:
-                    msg = f()
+                    msg = f() if callable(f) else str(f)
+                except Exception:
+                    msg = u""
+                if msg:
+                    break
+            if not msg:
+                try:
+                    msg = str(err)
                 except Exception:
                     msg = u""
             pt = None
@@ -131,6 +142,14 @@ class GeosValidity(object):
             out.append((msg, pt))
         return out
 
+    @staticmethod
+    def _classify(msg):
+        """Код по сообщению GEOS (эвристика: сообщения локализованы)."""
+        low = (msg or u"").lower()
+        if u"intersect" in low or u"пересек" in low or u"self" in low:
+            return CODE_SELF_INTERSECTION
+        return CODE_INVALID
+
     def check(self, fid, g, ctx=None):
         if g is None or g.isNull() or g.isEmpty():
             return [Violation(CODE_INVALID, SEV_ERROR, fid,
@@ -139,15 +158,12 @@ class GeosValidity(object):
             return []
         errs = self._validator_errors(g)
         if not errs:
-            return [Violation(CODE_INVALID, SEV_ERROR, fid,
+            return [Violation(CODE_SELF_INTERSECTION, SEV_ERROR, fid,
                               u"геометрия невалидна (GEOS)")]
         out = []
         for msg, pt in errs:
-            low = (msg or u"").lower()
-            code = CODE_SELF_INTERSECTION if u"intersect" in low \
-                else CODE_INVALID
             out.append(Violation(
-                code, SEV_ERROR, fid,
+                self._classify(msg), SEV_ERROR, fid,
                 msg or u"геометрия невалидна (GEOS)", point=pt))
         return out
 

@@ -81,7 +81,7 @@ def cadastral_layer():
 
 
 @pytest.fixture
-def editor_keep(monkeypatch):
+def editor_keep(monkeypatch, stub_iface):
     """TopoEditor с режимом перехлёстов «оставить» (без диалогов).
 
     Общая фикстура тестов инструментов и валидатора (этап 1)."""
@@ -93,6 +93,6 @@ def editor_keep(monkeypatch):
         lambda: tp_settings.OVERLAP_KEEP)
 
     def _make(layer):
-        return te_module.TopoEditor(stub_iface(), layer)
+        return te_module.TopoEditor(stub_iface, layer)
 
     return _make
