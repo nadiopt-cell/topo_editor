@@ -168,7 +168,16 @@ def get_snap_layers(editable_layer=None):
     :return: [QgsVectorLayer, ...]
     """
     disabled = settings.disabled_layer_ids()
-    result = [l for l in _reference_layers() if l.id() not in disabled]
+
+    def _alive(layer):
+        """True — слой доступен (C++ объект жив, id читается)."""
+        try:
+            return layer.id() is not None
+        except Exception:
+            return False
+
+    result = [l for l in _reference_layers()
+              if _alive(l) and l.id() not in disabled]
     if editable_layer is not None and editable_layer.isValid():
         eid = editable_layer.id()
         if eid not in disabled and all(l.id() != eid for l in result):

@@ -53,6 +53,8 @@ def project_crs_3857():
 @pytest.fixture
 def two_shared_node_layers():
     """Два memory-слоя в правке с общими узлами сетки 2x1."""
+    from topopolyedit import topology_index as tindex
+    from topopolyedit import snapping_engine as snap_eng
     layer_a, _tags_a = make_grid_layer(2, 1, name="multi_a")
     layer_b, _tags_b = make_grid_layer(2, 1, name="multi_b")
     for lyr in (layer_a, layer_b):
@@ -64,6 +66,18 @@ def two_shared_node_layers():
             lyr.rollBack()
         except Exception:
             pass
+    # снять индексы и кэш слоёв-эталонов ДО удаления слоёв: TTL-кэш
+    # (0,75 с) иначе отдаёт удалённые слои следующим тестам
+    for lyr in (layer_a, layer_b):
+        try:
+            tindex.drop_index(lyr)
+        except Exception:
+            pass
+    try:
+        snap_eng.invalidate_snap_layers_cache()
+    except Exception:
+        pass
+    for lyr in (layer_a, layer_b):
         _project().removeMapLayer(lyr.id())
 
 
@@ -174,8 +188,7 @@ def _transform_layer_to_4326(source_layer, name):
 
 
 def test_different_crs_nodes_stay_aligned(project_crs_3857,
-                                          two_shared_node_layers,
-                                          qgis_project):
+                                          two_shared_node_layers):
     layer_a, _unused = two_shared_node_layers
     layer_b = _transform_layer_to_4326(layer_a, "multi_crs")
     _project().addMapLayer(layer_b)
@@ -317,6 +330,12 @@ def test_edit_blacklist_excludes_layer(project_crs_3857,
     layer_a, layer_b = two_shared_node_layers
     monkeypatch.setattr(settings, "edit_disabled_ids",
                         lambda: {layer_b.id()})
+    # исключённый слой остаётся эталоном отсечения (как до этапа 4),
+    # что при общем узле честно режет перемещаемые; для чистой проверки
+    # чёрного списка отключаем per-layer отсечение по слою B
+    monkeypatch.setattr(settings, "clip_mode_for",
+                        lambda lid: settings.CLIP_IGNORE
+                        if lid == layer_b.id() else settings.CLIP_CLIP)
     editor = MultiLayerEditor(None, layer_a)
     report = editor.move_vertex(QgsPointXY(10, 10), QgsPointXY(11, 11))
     assert report.get("error") is None, report.get("error")

@@ -330,57 +330,69 @@ class TopoEditor(object):
         moving = set(moving_layer_ids or ())
         dest = self.layer.crs()
         for lyr in get_snap_layers(self.layer):
-            if lyr.id() == self.layer.id():
-                continue  # свой слой — отдельный сценарий (по запросу)
-            if lyr.id() in moving:
-                continue  # участник операции — двигается вместе (этап 4)
-            if lyr.geometryType() != QgsWkbTypes.PolygonGeometry:
-                continue  # отсекать можно только полигонами
             try:
-                mode = settings.clip_mode_for(lyr.id())
-            except Exception:
-                mode = settings.CLIP_CLIP
-            if mode == settings.CLIP_IGNORE:
-                continue  # «не трогать»: слой вне отсечения (этап 4, п. 7)
-            same = lyr.crs() == dest
-            ct = None
-            if same:
-                rect = bbox
-            else:
+                # слой может быть удалён из проекта, пока TTL-кэш слоёв
+                # прилипания (0,75 с) ещё отдаёт старый список: обращение
+                # к C++ объекту падает RuntimeError — слой просто
+                # пропускается
+                if lyr.id() == self.layer.id():
+                    continue  # свой слой — отдельный сценарий (по запросу)
+                if lyr.id() in moving:
+                    continue  # участник операции — двигается вместе
+                if lyr.geometryType() != QgsWkbTypes.PolygonGeometry:
+                    continue  # отсекать можно только полигонами
                 try:
-                    ct_d2l = QgsCoordinateTransform(dest, lyr.crs(),
-                                                    QgsProject.instance())
-                    rect = ct_d2l.transformBoundingBox(bbox)
-                    ct = QgsCoordinateTransform(lyr.crs(), dest,
-                                                QgsProject.instance())
+                    mode = settings.clip_mode_for(lyr.id())
                 except Exception:
-                    continue
-            try:
-                req = QgsFeatureRequest(rect)
-                req.setSubsetOfAttributes([])
-                for feat in lyr.getFeatures(req):
-                    g = feat.geometry()
-                    if g is None or g.isNull() or g.isEmpty():
+                    mode = settings.CLIP_CLIP
+                if mode == settings.CLIP_IGNORE:
+                    continue  # «не трогать»: слой вне отсечения (этап 4,
+                    # п. 7)
+                same = lyr.crs() == dest
+                ct = None
+                if same:
+                    rect = bbox
+                else:
+                    try:
+                        ct_d2l = QgsCoordinateTransform(
+                            dest, lyr.crs(), QgsProject.instance())
+                        rect = ct_d2l.transformBoundingBox(bbox)
+                        ct = QgsCoordinateTransform(
+                            lyr.crs(), dest, QgsProject.instance())
+                    except Exception:
                         continue
-                    if ct is not None:
-                        try:
-                            g = QgsGeometry(g)
-                            if g.transform(ct) != 0:
-                                continue
-                        except Exception as exc:
-                            utils.log(u"Эталон «{}» #{}: сбой преобразования "
-                                      u"CRS — пропущен ({})"
-                                      .format(lyr.name(), feat.id(), exc))
+                try:
+                    req = QgsFeatureRequest(rect)
+                    req.setSubsetOfAttributes([])
+                    for feat in lyr.getFeatures(req):
+                        g = feat.geometry()
+                        if g is None or g.isNull() or g.isEmpty():
                             continue
-                    if mode == settings.CLIP_ASK:
-                        ask_refs.append((g, lyr.name()))
-                    else:
-                        refs.append(g)
-                    if len(refs) >= MAX_CLIP_REFS:
-                        return refs, True, ask_refs
-            except Exception as exc:
-                utils.log(u"Слой «{}»: сбой чтения эталонов — {}"
-                          .format(lyr.name(), exc))
+                        if ct is not None:
+                            try:
+                                g = QgsGeometry(g)
+                                if g.transform(ct) != 0:
+                                    continue
+                            except Exception as exc:
+                                utils.log(
+                                    u"Эталон «{}» #{}: сбой преобразования "
+                                    u"CRS — пропущен ({})"
+                                    .format(lyr.name(), feat.id(), exc))
+                                continue
+                        if mode == settings.CLIP_ASK:
+                            ask_refs.append((g, lyr.name()))
+                        else:
+                            refs.append(g)
+                        if len(refs) >= MAX_CLIP_REFS:
+                            return refs, True, ask_refs
+                except Exception as exc:
+                    utils.log(u"Слой «{}»: сбой чтения эталонов — {}"
+                              .format(lyr.name(), exc))
+                    continue
+            except Exception:
+                # удалённый/недоступный слой — пропустить без срыва
+                # операции (в журнал не пишем: частый случай после
+                # удаления слоёв при живом кэше)
                 continue
         return refs, False, ask_refs
 
