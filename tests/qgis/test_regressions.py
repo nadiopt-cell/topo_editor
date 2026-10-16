@@ -111,6 +111,9 @@ def test_rubber_pool_does_not_grow_scene(iface_canvas):
     rb1 = tool._make_polygon_rubber()
     tool._reset_poly_rubbers()
     rb2 = tool._make_polygon_rubber()
+    # сброс обязателен: иначе следующая выдача из пула (индекс 1 при
+    # пуле из 1) честно создаст НОВУЮ ленту — регрессия этапа 0
+    tool._reset_poly_rubbers()
     assert rb1 is rb2, "лента должна переиспользоваться из пула"
     scene = iface_canvas.mapCanvas().scene()
     # scene.items() на настоящем Qt — список Python: только len()

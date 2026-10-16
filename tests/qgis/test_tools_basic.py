@@ -218,15 +218,18 @@ def _far_part_bbox(layer, fid):
 
 
 def _hole_area(layer, fid):
-    """Площадь дыры полигона (внутреннее кольцо)."""
+    """Площадь дыры (внутреннего кольца) — только сама дыра.
+
+    Площадь внешнего кольца законно меняется при перемещении узлов,
+    поэтому сравнивать можно только дыру (регрессия этапа 0: внешний
+    минус дыра дал 92.0 != 91.5 при неизменённой дыре 12.0)."""
     for f in layer.getFeatures():
         if f.id() == fid:
             parts = (f.geometry().asMultiPolygon()
                      if f.geometry().isMultipart()
                      else [f.geometry().asPolygon()])
-            outer, hole = parts[0][0], parts[0][1]
-            return (QgsGeometry_shoelace(outer) -
-                    abs(QgsGeometry_shoelace(hole)))
+            hole = parts[0][1]
+            return abs(QgsGeometry_shoelace(hole))
     raise AssertionError("фича {} не найдена".format(fid))
 
 
