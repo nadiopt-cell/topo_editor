@@ -32,11 +32,16 @@ from .core.validator import (
     SEV_WARNING,
 )
 from .snapping_engine import get_snap_layers
+from . import topology_index as tindex
 from . import settings
 from . import utils
 
 MAX_CLIP_REFS = 5000  # предохранитель на число эталонных полигонов
-MAX_OVERLAP_NEIGHBORS = 500  # соседей того же слоя для проверки перехлёста
+# Лимит соседей того же слоя для проверки перехлёста (этап 3 ТЗ, п. 7:
+# прежний жёсткий лимит 500 заменён на MAX_OVERLAP_NEIGHBORS 5000,
+# значение читается из настроек при каждой операции — см.
+# _same_layer_neighbors; константа оставлена для совместимости/тестов).
+MAX_OVERLAP_NEIGHBORS = settings.DEFAULT_MAX_NEIGHBORS
 
 # Перехлёст меньше этой доли площади меньшего из двух полигонов считается
 # погрешностью (шов по общей границе, шум float) и не обрабатывается.
@@ -95,6 +100,22 @@ def union_bbox(geoms):
         else:
             bbox.combineExtentWith(r)  # изменяет на месте, возвращает None
     return bbox
+
+
+def _copy_polys(polys):
+    """Глубокая копия нормализованной структуры.
+
+    Снимки индекса топологии (этап 3) разделяются между запросами;
+    операции мутируют структуру (insert_vertex_topo вставляет вершину
+    на месте) — копия изолирует кэш от правки."""
+    return [[[QgsPointXY(v) for v in ring] for ring in part]
+            for part in polys]
+
+
+class _IndexUnserved(Exception):
+    """Область не обслуживается индексом топологии (плитка не собрана
+    из-за бюджета/слишком широка) — ТИХИЙ переход к прямому запросу
+    к слою (не ошибка, в журнал не пишется)."""
 
 
 def find_overlaps(prepared, neighbors, min_ratio=OVERLAP_MIN_RATIO):
@@ -160,6 +181,51 @@ class TopoEditor(object):
         self.makevalid_decider = makevalid_decider
 
     # ------------------------------------------------------------------
+    # Индекс топологии (этап 3 ТЗ)
+    # ------------------------------------------------------------------
+
+    def _index(self):
+        """Индекс топологии слоя или None (выключен настройкой,
+        недоступен). При первом обращении задаёт размер плиток по
+        видимому экстенту карты (ТЗ этап 3, п. 2)."""
+        try:
+            idx = tindex.index_for_layer(self.layer)
+        except Exception:
+            return None
+        if idx is not None and self.iface is not None:
+            try:
+                idx.seed_extent_from_iface(self.iface)
+            except Exception:
+                pass
+        return idx
+
+    def _features_in_rect(self, rect):
+        """[(fid, polys, was_multi), ...] — снимки фич под rect.
+
+        Индекс топологии (этап 3): снимки norm_polys из кэша плиток
+        (мгновенно после первой сборки); копируются — операции мутируют
+        структуру. Fallback — прямой запрос getFeatures(rect), как до
+        этапа 3 (индекс выключен / не обслужил / сбой)."""
+        idx = self._index()
+        if idx is not None:
+            try:
+                rows = idx.rect_features(rect)
+                if rows is not None:
+                    return [(fid, _copy_polys(p), m)
+                            for fid, p, m in rows]
+            except Exception as exc:
+                utils.log(u"Индекс: запрос по области не удался — {} "
+                          u"(прямой запрос)".format(exc))
+        out = []
+        req = QgsFeatureRequest(rect)
+        req.setSubsetOfAttributes([])
+        for feat in self.layer.getFeatures(req):
+            nr = norm_polys(feat.geometry())
+            if nr:
+                out.append((feat.id(), nr[0], nr[1]))
+        return out
+
+    # ------------------------------------------------------------------
     # Внутренние помощники
     # ------------------------------------------------------------------
 
@@ -181,10 +247,39 @@ class TopoEditor(object):
 
         :return: [{"fid", "polys", "multi"}, ...]
         """
+        eps2 = match_eps * match_eps
+        idx = self._index()
+        if idx is not None:
+            try:
+                fids = idx.features_near_points([old_pt], match_eps)
+                if fids is None:
+                    # область не обслуживается (плитка не собрана) —
+                    # падаем в прямой запрос ниже
+                    raise _IndexUnserved()
+                entries = []
+                for fid in sorted(fids):
+                    snap = idx.snapshot_geometry(self.layer, fid)
+                    if not snap:
+                        continue
+                    polys = _copy_polys(snap[0])  # кэш не мутируется
+                    was_multi = snap[1]
+                    # T-залатывание ДО замены: рёбра, на которых лежит old_pt
+                    for a, b in find_t_edges(polys, old_pt, eps2):
+                        insert_vertex_topo(polys, a, b, old_pt, eps2)
+                    new_polys, changed = replace_vertices(
+                        polys, old_pt, new_pt, eps2)
+                    if changed:
+                        entries.append({"fid": fid, "polys": new_polys,
+                                        "multi": was_multi})
+                return entries
+            except _IndexUnserved:
+                pass
+            except Exception as exc:
+                utils.log(u"Индекс: поиск задетых узлом фич не удался — "
+                          u"{} (прямой запрос)".format(exc))
         rect = QgsRectangle(old_pt.x() - match_eps, old_pt.y() - match_eps,
                             old_pt.x() + match_eps, old_pt.y() + match_eps)
         rect.grow(match_eps)
-        eps2 = match_eps * match_eps
         entries = []
         req = QgsFeatureRequest(rect)
         req.setSubsetOfAttributes([])
@@ -305,10 +400,46 @@ class TopoEditor(object):
     def _same_layer_neighbors(self, bbox, exclude_ids):
         """Прочие полигоны редактируемого слоя в габарите bbox.
 
+        Индекс топологии (этап 3): fids из QgsSpatialIndex плиток +
+        геометрии из снимков (мгновенно, без запроса к слою). Fallback —
+        прямой запрос getFeatures(bbox), как до этапа 3.
+
         :param exclude_ids: {fid, ...} — перемещаемые фичи (не соседи)
-        :return: [(fid, QgsGeometry)] в CRS слоя (не больше
-                 MAX_OVERLAP_NEIGHBORS)
+        :return: [(fid, QgsGeometry)] в CRS слоя (не больше лимита
+                 settings.max_overlap_neighbors() — ТЗ этап 3, п. 7:
+                 5000 по умолчанию)
         """
+        limit = settings.max_overlap_neighbors()
+        idx = self._index()
+        if idx is not None:
+            try:
+                mapping = idx.bbox_features(bbox)
+                if mapping is not None:
+                    out = []
+                    for fid in mapping.get(idx.layer_id, ()):
+                        if fid in exclude_ids:
+                            continue
+                        snap = idx.snapshot_geometry(self.layer, fid)
+                        if not snap:
+                            continue
+                        g = polys_to_geom(snap[0], snap[1])
+                        if g is None or g.isNull() or g.isEmpty():
+                            continue
+                        if g.type() != QgsWkbTypes.PolygonGeometry:
+                            continue
+                        out.append((fid, g))
+                        if len(out) > limit:
+                            raise RuntimeError(
+                                u"Соседей в области больше {} — операция "
+                                u"отменена, чтобы не выполнить частичное "
+                                u"отсечение; уменьшите перемещаемый "
+                                u"участок".format(limit))
+                    return out
+            except RuntimeError:
+                raise  # явный лимит соседей — не деградировать в прямой запрос
+            except Exception as exc:
+                utils.log(u"Индекс: соседи не получены — {} "
+                          u"(прямой запрос)".format(exc))
         out = []
         req = QgsFeatureRequest(bbox)
         req.setSubsetOfAttributes([])
@@ -321,12 +452,11 @@ class TopoEditor(object):
             if g.type() != QgsWkbTypes.PolygonGeometry:
                 continue
             out.append((feat.id(), g))
-            if len(out) > MAX_OVERLAP_NEIGHBORS:
+            if len(out) > limit:
                 raise RuntimeError(
                     u"Соседей в области больше {} — операция отменена, "
                     u"чтобы не выполнить частичное отсечение; "
-                    u"уменьшите перемещаемый участок".format(
-                        MAX_OVERLAP_NEIGHBORS))
+                    u"уменьшите перемещаемый участок".format(limit))
         return out
 
     def preview_overlaps(self, prepared, exclude_ids):
@@ -753,6 +883,19 @@ class TopoEditor(object):
             # слой запоминается для кнопки «Отменить» (штатная отмена QGIS
             # привязана к активному слою и может быть недоступна)
             utils.note_edited_layer(self.layer)
+            # журнал габарита операции для afterRollBack индекса (этап 3,
+            # п. 3): НОВЫЕ и СТАРЫЕ положения затронутых фич + запас
+            try:
+                old_g = [g for g in old_geoms.values()
+                         if g is not None and not g.isNull()]
+                new_g = [g for g in final.values()
+                         if g is not None and not g.isNull()]
+                op_bbox = union_bbox(new_g + old_g)
+                if op_bbox is not None:
+                    op_bbox.grow(eps * 10.0)
+                    utils.note_operation_bbox(self.layer, op_bbox)
+            except Exception:
+                pass
         except Exception as exc:
             if command_started:
                 self.layer.destroyEditCommand()
@@ -833,13 +976,7 @@ class TopoEditor(object):
         rect.grow(pad)
         eps2 = match_eps * match_eps
         entries = []
-        req = QgsFeatureRequest(rect)
-        req.setSubsetOfAttributes([])
-        for feat in self.layer.getFeatures(req):
-            nr = norm_polys(feat.geometry())
-            if not nr:
-                continue
-            polys, was_multi = nr
+        for fid, polys, was_multi in self._features_in_rect(rect):
             # 1) T-залатывание ДО переноса: якорь на ребре фичи без узла
             for anchor in anchors:
                 for a, b in find_t_edges(polys, anchor, eps2):
@@ -854,7 +991,7 @@ class TopoEditor(object):
                     QgsPointXY(old_r.x() + dx, old_r.y() + dy), eps2)
                 changed += ch2
             if changed:
-                entries.append({"fid": feat.id(), "polys": new_polys,
+                entries.append({"fid": fid, "polys": new_polys,
                                 "multi": was_multi})
         return entries
 
@@ -876,6 +1013,36 @@ class TopoEditor(object):
         :return: [{"fid", "polys", "multi"}, ...] — патчи к плану
         """
         eps2 = match_eps * match_eps
+        idx = self._index()
+        if idx is not None:
+            try:
+                fids = idx.features_near_points(pts, match_eps)
+                if fids is None:
+                    # область не обслуживается — прямой запрос ниже
+                    raise _IndexUnserved()
+                entries = []
+                for fid in sorted(fids):
+                    if fid in exclude_ids:
+                        continue
+                    snap = idx.snapshot_geometry(self.layer, fid)
+                    if not snap:
+                        continue
+                    polys = _copy_polys(snap[0])  # кэш не мутируется
+                    was_multi = snap[1]
+                    changed = 0
+                    for p in pts:
+                        for a, b in find_t_edges(polys, p, eps2):
+                            changed += insert_vertex_topo(polys, a, b,
+                                                          p, eps2)
+                    if changed:
+                        entries.append({"fid": fid, "polys": polys,
+                                        "multi": was_multi})
+                return entries
+            except _IndexUnserved:
+                pass
+            except Exception as exc:
+                utils.log(u"Индекс: T-залатывание не удалось — {} "
+                          u"(прямой запрос)".format(exc))
         rect = points_bbox(pts)
         if rect is None:
             return []
@@ -974,16 +1141,10 @@ class TopoEditor(object):
             rect.grow(max(match_eps * 10.0, (w + h) * 0.001, 1e-6))
             eps2 = match_eps * match_eps
             targets = []
-            req = QgsFeatureRequest(rect)
-            req.setSubsetOfAttributes([])
-            for feat in self.layer.getFeatures(req):
-                nr = norm_polys(feat.geometry())
-                if not nr:
-                    continue
-                polys, was_multi = nr
+            for fid, polys, was_multi in self._features_in_rect(rect):
                 cnt = insert_vertex_topo(polys, p1, p2, new_pt, eps2)
                 if cnt:
-                    targets.append({"fid": feat.id(), "polys": polys,
+                    targets.append({"fid": fid, "polys": polys,
                                     "multi": was_multi})
                     report["inserted"] += cnt
             if not targets:
@@ -1016,6 +1177,11 @@ class TopoEditor(object):
                 report["features"] += 1
             self.layer.endEditCommand()
             utils.note_edited_layer(self.layer)  # для кнопки «Отменить»
+            # журнал габарита для afterRollBack индекса (этап 3, п. 3)
+            try:
+                utils.note_operation_bbox(self.layer, rect)
+            except Exception:
+                pass
             self.layer.triggerRepaint()
         except Exception as exc:
             try:

@@ -18,7 +18,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
     QListWidget, QListWidgetItem, QPushButton, QComboBox, QDoubleSpinBox,
-    QDialogButtonBox, QCheckBox,
+    QSpinBox, QDialogButtonBox, QCheckBox,
 )
 from qgis.core import QgsProject, QgsWkbTypes, QgsVectorLayer
 
@@ -174,6 +174,63 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp_vis)
 
         # --------------------------------------------------------------
+        # Индекс топологии (этап 3 ТЗ)
+        # --------------------------------------------------------------
+        grp_idx = QGroupBox(u"Индекс топологии", self)
+        ix = QVBoxLayout(grp_idx)
+        self.chk_index = QCheckBox(
+            u"Использовать индекс топологии (рекомендуется)", grp_idx)
+        self.chk_index.setToolTip(
+            u"Индекс строитcя лениво по плиткам: поиск узлов, рёбер и\n"
+            u"соседей становится мгновенным, лимит соседей растёт до 5000.\n"
+            u"При выключении все запросы идут к слою напрямую (как раньше)\n"
+            u"— откат при странном поведении.")
+        self.chk_index.setChecked(bool(cfg.get("index_on",
+                                               settings.DEFAULT_INDEX_ON)))
+        ix.addWidget(self.chk_index)
+
+        row_nb = QHBoxLayout()
+        row_nb.addWidget(QLabel(
+            u"Лимит соседей того же слоя:", grp_idx))
+        self.spn_neighbors = QSpinBox(grp_idx)
+        self.spn_neighbors.setRange(settings.MIN_MAX_NEIGHBORS,
+                                    settings.MAX_MAX_NEIGHBORS)
+        self.spn_neighbors.setSingleStep(500)
+        self.spn_neighbors.setValue(int(cfg.get(
+            "max_neighbors", settings.DEFAULT_MAX_NEIGHBORS)))
+        self.spn_neighbors.setToolTip(
+            u"При превышении операция отменяется с явным сообщением\n"
+            u"(защита от частичного отсечения). По умолчанию 5000.")
+        row_nb.addWidget(self.spn_neighbors, 1)
+        ix.addLayout(row_nb)
+
+        row_tf = QHBoxLayout()
+        row_tf.addWidget(QLabel(
+            u"Размер плитки (× видимый экстент):", grp_idx))
+        self.spn_tile = QDoubleSpinBox(grp_idx)
+        self.spn_tile.setRange(settings.MIN_TILE_FACTOR,
+                               settings.MAX_TILE_FACTOR)
+        self.spn_tile.setDecimals(1)
+        self.spn_tile.setSingleStep(0.5)
+        self.spn_tile.setValue(float(cfg.get("tile_factor",
+                                             settings.DEFAULT_TILE_FACTOR)))
+        self.spn_tile.setToolTip(
+            u"Индекс строится по плиткам размером видимый экстент × это\n"
+            u"число (по умолчанию 2). Меньше — быстрее первая сборка,\n"
+            u"больше — меньше пересборок при перемещении по карте.")
+        row_tf.addWidget(self.spn_tile, 1)
+        ix.addLayout(row_tf)
+
+        idx_hint = QLabel(
+            u"Первая операция в новой области строит плитку (бюджет 0,4 с;\n"
+            u"при превышении запросы по ней идут к слою напрямую),\n"
+            u"повторные — мгновенны. Сборка плиток в фоне (QgsTask)\n"
+            u"используется пакетными операциями.", grp_idx)
+        idx_hint.setWordWrap(True)
+        ix.addWidget(idx_hint)
+        lay.addWidget(grp_idx)
+
+        # --------------------------------------------------------------
         # Кнопки
         # --------------------------------------------------------------
         row_btn = QHBoxLayout()
@@ -311,6 +368,9 @@ class SettingsDialog(QDialog):
         self.chk_hints.setChecked(settings.DEFAULT_SHOW_HINTS)
         self.chk_slide.setChecked(settings.DEFAULT_EDGE_SLIDE)
         self._select_overlap(settings.DEFAULT_OVERLAP_MODE)
+        self.chk_index.setChecked(settings.DEFAULT_INDEX_ON)
+        self.spn_neighbors.setValue(settings.DEFAULT_MAX_NEIGHBORS)
+        self.spn_tile.setValue(settings.DEFAULT_TILE_FACTOR)
 
     def current_config(self):
         """Текущее состояние диалога в виде конфига settings.save_settings."""
@@ -328,6 +388,9 @@ class SettingsDialog(QDialog):
                              else settings.DEFAULT_OVERLAP_MODE),
             "show_hints": self.chk_hints.isChecked(),
             "edge_slide": self.chk_slide.isChecked(),
+            "index_on": self.chk_index.isChecked(),
+            "max_neighbors": self.spn_neighbors.value(),
+            "tile_factor": self.spn_tile.value(),
         }
 
     def apply(self):

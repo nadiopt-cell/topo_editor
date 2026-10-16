@@ -38,6 +38,10 @@ KEY_SEAM_RATIO = SNAP_SECTION + "/seam_min_ratio"
 KEY_SHARED_SEVERITY = SNAP_SECTION + "/shared_boundary_severity"
 KEY_OFFER_MAKEVALID = SNAP_SECTION + "/offer_makevalid"
 KEY_EDGE_SLIDE = SNAP_SECTION + "/edge_slide_on_neighbors"
+# индекс топологии (этап 3 ТЗ)
+KEY_INDEX_ON = SNAP_SECTION + "/topology_index_on"
+KEY_MAX_NEIGHBORS = SNAP_SECTION + "/max_overlap_neighbors"
+KEY_TILE_FACTOR = SNAP_SECTION + "/index_tile_factor"
 
 # Единицы допуска
 UNITS_PX = "px"      # пиксели экрана
@@ -68,6 +72,15 @@ DEFAULT_SPIKE_SEVERITY = SEV_WARNING   # шипы — настраиваемо (
 DEFAULT_SHARED_SEVERITY = SEV_WARNING  # потеря общих узлов
 DEFAULT_OFFER_MAKEVALID = False     # авторемонт makeValid — выкл. (ТЗ 1.6)
 DEFAULT_EDGE_SLIDE = True   # скользить по соседнему ребру (ТЗ этап 2)
+
+# Индекс топологии (ТЗ этап 3)
+DEFAULT_INDEX_ON = True         # индекс включён; выкл. = работа как раньше
+DEFAULT_MAX_NEIGHBORS = 5000    # лимит соседей того же слоя (был 500)
+DEFAULT_TILE_FACTOR = 2.0       # размер плитки = видимый экстент × фактор
+MIN_MAX_NEIGHBORS = 100
+MAX_MAX_NEIGHBORS = 1000000
+MIN_TILE_FACTOR = 0.5
+MAX_TILE_FACTOR = 20.0
 
 # Границы допуска (в любых единицах)
 MIN_TOL = 0.1
@@ -167,6 +180,9 @@ def load_settings():
         "overlap_mode": DEFAULT_OVERLAP_MODE,
         "show_hints": DEFAULT_SHOW_HINTS,
         "edge_slide": DEFAULT_EDGE_SLIDE,
+        "index_on": DEFAULT_INDEX_ON,
+        "max_neighbors": DEFAULT_MAX_NEIGHBORS,
+        "tile_factor": DEFAULT_TILE_FACTOR,
     }
     qs = _qsettings()
     if qs is None:
@@ -208,6 +224,29 @@ def load_settings():
             qs.value(KEY_EDGE_SLIDE, DEFAULT_EDGE_SLIDE), DEFAULT_EDGE_SLIDE)
     except Exception:
         pass
+    try:
+        cfg["index_on"] = _as_bool(
+            qs.value(KEY_INDEX_ON, DEFAULT_INDEX_ON), DEFAULT_INDEX_ON)
+    except Exception:
+        pass
+    try:
+        cfg["max_neighbors"] = int(qs.value(
+            KEY_MAX_NEIGHBORS, DEFAULT_MAX_NEIGHBORS, type=int))
+        cfg["max_neighbors"] = min(
+            max(cfg["max_neighbors"], MIN_MAX_NEIGHBORS),
+            MAX_MAX_NEIGHBORS)
+    except Exception:
+        pass
+    try:
+        cfg["tile_factor"] = float(qs.value(
+            KEY_TILE_FACTOR, DEFAULT_TILE_FACTOR, type=float))
+        if cfg["tile_factor"] != cfg["tile_factor"] or \
+                cfg["tile_factor"] in (float("inf"), float("-inf")):
+            cfg["tile_factor"] = DEFAULT_TILE_FACTOR
+        cfg["tile_factor"] = min(max(cfg["tile_factor"], MIN_TILE_FACTOR),
+                                 MAX_TILE_FACTOR)
+    except Exception:
+        pass
     return cfg
 
 
@@ -244,6 +283,23 @@ def save_settings(cfg):
             cfg.get("show_hints", DEFAULT_SHOW_HINTS), DEFAULT_SHOW_HINTS))
         qs.setValue(KEY_EDGE_SLIDE, _as_bool(
             cfg.get("edge_slide", DEFAULT_EDGE_SLIDE), DEFAULT_EDGE_SLIDE))
+        qs.setValue(KEY_INDEX_ON, _as_bool(
+            cfg.get("index_on", DEFAULT_INDEX_ON), DEFAULT_INDEX_ON))
+        try:
+            qs.setValue(KEY_MAX_NEIGHBORS, int(
+                min(max(int(cfg.get("max_neighbors",
+                                    DEFAULT_MAX_NEIGHBORS)),
+                        MIN_MAX_NEIGHBORS), MAX_MAX_NEIGHBORS)))
+        except Exception:
+            qs.setValue(KEY_MAX_NEIGHBORS, DEFAULT_MAX_NEIGHBORS)
+        try:
+            tf = float(cfg.get("tile_factor", DEFAULT_TILE_FACTOR))
+            if tf != tf or tf in (float("inf"), float("-inf")):
+                tf = DEFAULT_TILE_FACTOR
+            qs.setValue(KEY_TILE_FACTOR,
+                        min(max(tf, MIN_TILE_FACTOR), MAX_TILE_FACTOR))
+        except Exception:
+            qs.setValue(KEY_TILE_FACTOR, DEFAULT_TILE_FACTOR)
         return True
     except Exception:
         return False
@@ -456,6 +512,62 @@ def edge_slide_on_neighbors():
         return DEFAULT_EDGE_SLIDE
 
 
+# ----------------------------------------------------------------------
+# Индекс топологии (этап 3 ТЗ): читаются при каждой операции — только
+# свои ключи, как overlap_mode.
+# ----------------------------------------------------------------------
+
+def index_enabled():
+    """True — операции используют индекс топологии (этап 3 ТЗ).
+
+    При выключенном индексе все запросы идут к слою напрямую (как до
+    этапа 3) — откат при странном поведении индекса."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_INDEX_ON
+    try:
+        return _as_bool(qs.value(KEY_INDEX_ON, DEFAULT_INDEX_ON),
+                        DEFAULT_INDEX_ON)
+    except Exception:
+        return DEFAULT_INDEX_ON
+
+
+def max_overlap_neighbors():
+    """Лимит соседей того же слоя для проверки перехлёста (ТЗ этап 3,
+    п. 7: лимит 500 заменён на MAX_OVERLAP_NEIGHBORS, по умолчанию
+    5000, с явным сообщением при превышении)."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_MAX_NEIGHBORS
+    try:
+        value = int(qs.value(KEY_MAX_NEIGHBORS, DEFAULT_MAX_NEIGHBORS,
+                             type=int))
+    except Exception:
+        return DEFAULT_MAX_NEIGHBORS
+    if value != value:  # NaN невозможен для int, страховка от мусора
+        return DEFAULT_MAX_NEIGHBORS
+    return min(max(value, MIN_MAX_NEIGHBORS), MAX_MAX_NEIGHBORS)
+
+
+def tile_factor():
+    """Множитель видимого экстента для размера плитки индекса.
+
+    ТЗ этап 3, п. 2: размер плитки настраиваемый, по умолчанию видимый
+    экстент × 2. Изменение применяется к НОВЫМ индексам; у построенного
+    индекса сетка плиток сохраняется до его сброса."""
+    qs = _qsettings()
+    if qs is None:
+        return DEFAULT_TILE_FACTOR
+    try:
+        value = float(qs.value(KEY_TILE_FACTOR, DEFAULT_TILE_FACTOR,
+                               type=float))
+    except Exception:
+        return DEFAULT_TILE_FACTOR
+    if value != value or value in (float("inf"), float("-inf")):
+        return DEFAULT_TILE_FACTOR
+    return min(max(value, MIN_TILE_FACTOR), MAX_TILE_FACTOR)
+
+
 def validator_opts():
     """Готовый словарь opts для core.validator.validate_operation()."""
     return {
@@ -479,7 +591,8 @@ def reset_to_defaults():
                     KEY_OVERLAP_MODE, KEY_SHOW_HINTS, KEY_SPIKE_ANGLE,
                     KEY_SPIKE_SEVERITY, KEY_SEAM_RATIO,
                     KEY_SHARED_SEVERITY, KEY_OFFER_MAKEVALID,
-                    KEY_EDGE_SLIDE):
+                    KEY_EDGE_SLIDE, KEY_INDEX_ON, KEY_MAX_NEIGHBORS,
+                    KEY_TILE_FACTOR):
             try:
                 qs.remove(key)
             except Exception:

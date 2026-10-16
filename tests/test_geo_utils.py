@@ -77,6 +77,18 @@ class QgsRectangle(object):
         self.xmax += m
         self.ymax += m
 
+    def xMinimum(self):
+        return self.xmin
+
+    def yMinimum(self):
+        return self.ymin
+
+    def xMaximum(self):
+        return self.xmax
+
+    def yMaximum(self):
+        return self.ymax
+
     def width(self):
         return self.xmax - self.xmin
 
@@ -115,6 +127,50 @@ class QgsFeatureRequest(object):
         """Этап 1: выборка по fid (используется _old_geoms валидатора)."""
         self.fids = list(fids)
         return self
+
+
+class QgsFeature(object):
+    """Этап 3: стаб для QgsSpatialIndex.addFeature/deleteFeature
+    (ид + геометрия — больше от фичи индексу не нужно)."""
+
+    def __init__(self, fid=None):
+        self._fid = fid
+        self._geom = None
+
+    def setId(self, fid):
+        self._fid = fid
+
+    def id(self):
+        return self._fid
+
+    def setGeometry(self, geom):
+        self._geom = geom
+
+    def geometry(self):
+        return self._geom
+
+
+class QgsSpatialIndex(object):
+    """Этап 3: стаб индекса по габаритам фич (как реальный:
+    addFeature/deleteFeature/intersects; пересечение — по bbox)."""
+
+    def __init__(self):
+        self._rects = {}
+
+    def addFeature(self, feat):
+        g = feat.geometry()
+        if g is None:
+            return False
+        self._rects[feat.id()] = g.boundingBox()
+        return True
+
+    def deleteFeature(self, feat):
+        self._rects.pop(feat.id(), None)
+        return True
+
+    def intersects(self, rect):
+        return [fid for fid, r in self._rects.items()
+                if r.intersects(rect)]
 
 
 class QgsProject(object):
@@ -325,6 +381,8 @@ core_mod.QgsPointXY = QgsPointXY
 core_mod.QgsRectangle = QgsRectangle
 core_mod.QgsWkbTypes = QgsWkbTypes
 core_mod.QgsGeometry = QgsGeometry
+core_mod.QgsFeature = QgsFeature
+core_mod.QgsSpatialIndex = QgsSpatialIndex
 # имена, нужные для импорта topopolyedit.topo_editor (см. секцию 16)
 core_mod.QgsFeatureRequest = QgsFeatureRequest
 core_mod.QgsProject = QgsProject
@@ -1193,7 +1251,10 @@ check("18c load: значения совпадают (новые ключи — 
                              "units": st.UNITS_MAP, "disabled": ["a", "b"],
                              "overlap_mode": st.OVERLAP_ASK,
                              "show_hints": True,
-                             "edge_slide": True})
+                             "edge_slide": True,
+                             "index_on": st.DEFAULT_INDEX_ON,
+                             "max_neighbors": st.DEFAULT_MAX_NEIGHBORS,
+                             "tile_factor": st.DEFAULT_TILE_FACTOR})
 check("18c disabled_layer_ids: множество {'a','b'}",
       st.disabled_layer_ids() == {"a", "b"})
 
@@ -2615,6 +2676,360 @@ new_c33, ch_c33 = gu.replace_vertices(
     pt(riders33[0].x() + delta33[0], riders33[0].y() + delta33[1]), 1e-12)
 check("32 пассажир: вершина переехала на новое ребро",
       ch_c33 == 1 and gu.contains_vertex(new_c33, pt(15, 22), 1e-12))
+
+# ---------------------------------------------------------------------------
+# 33. Индекс топологии (этап 3 ТЗ): плитки, узлы, рёбра, соседи,
+#     хирургическая инвалидация, откат, бюджет, целостность
+# ---------------------------------------------------------------------------
+import topopolyedit.topology_index as ti  # noqa: E402
+
+
+class _Sig(object):
+    """Мини-сигнал Qt: connect/disconnect/emit (имена как у PyQt)."""
+
+    def __init__(self):
+        self._slots = []
+
+    def connect(self, slot):
+        self._slots.append(slot)
+
+    def disconnect(self, slot):
+        try:
+            self._slots.remove(slot)
+        except ValueError:
+            pass
+
+    def emit(self, *args):
+        for s in list(self._slots):
+            s(*args)
+
+
+class _IndexFeat(object):
+    def __init__(self, fid, geom):
+        self._fid = fid
+        self._g = geom
+
+    def id(self):
+        return self._fid
+
+    def geometry(self):
+        return self._g
+
+
+class _IndexLyr(object):
+    """Полигональный слой с сигналами правки и bbox-запросом.
+
+    change_geom/add_geom/del_geom эмулируют правки через edit buffer
+    (QGIS издаёт те же сигналы); set_geom_quiet — правка БЕЗ сигнала
+    (так выглядит состояние до отката)."""
+
+    def __init__(self, geoms, lid="idx_lyr"):
+        self._feats = {}
+        next_fid = 1
+        for g in geoms:
+            self._feats[next_fid] = _IndexFeat(next_fid, g)
+            next_fid += 1
+        self._next_fid = next_fid
+        self._lid = lid
+        self.geometryChanged = _Sig()
+        self.featureAdded = _Sig()
+        self.featureDeleted = _Sig()
+        self.committedGeometriesChanges = _Sig()
+        self.editingStopped = _Sig()
+        self.afterRollBack = _Sig()
+
+    def id(self):
+        return self._lid
+
+    def name(self):
+        return self._lid
+
+    def isValid(self):
+        return True
+
+    def geometryType(self):
+        return QgsWkbTypes.PolygonGeometry
+
+    def crs(self):
+        return _Crs("EPSG:3857")
+
+    def extent(self):
+        bb = None
+        for f in self._feats.values():
+            r = f.geometry().boundingBox()
+            if bb is None:
+                bb = r
+            else:
+                bb.combineExtentWith(r)
+        return bb
+
+    def getFeatures(self, req):
+        if getattr(req, "fids", None) is not None:
+            return [self._feats[f] for f in req.fids if f in self._feats]
+        feats = list(self._feats.values())
+        if req.rect is not None:
+            return [f for f in feats
+                    if f.geometry().boundingBox().intersects(req.rect)]
+        return feats
+
+    def getFeature(self, fid):
+        f = self._feats.get(fid)
+        if f is None:
+            raise KeyError("фича #{} отсутствует".format(fid))
+        return f
+
+    # --- edit-команды и запись (как у реального QgsVectorLayer;
+    #     changeGeometry издаёт geometryChanged — по нему живёт индекс) ---
+
+    def beginEditCommand(self, text):
+        pass
+
+    def endEditCommand(self):
+        pass
+
+    def destroyEditCommand(self):
+        pass
+
+    def triggerRepaint(self):
+        pass
+
+    def changeGeometry(self, fid, geom):
+        self._feats[fid]._g = geom
+        self.geometryChanged.emit(fid, geom)
+        return True
+
+    # --- симуляция правок ------------------------------------------------
+
+    def change_geom(self, fid, geom):
+        self._feats[fid]._g = geom
+        self.geometryChanged.emit(fid, geom)
+
+    def add_geom(self, fid, geom):
+        self._feats[fid] = _IndexFeat(fid, geom)
+        self.featureAdded.emit(fid)
+
+    def del_geom(self, fid):
+        del self._feats[fid]
+        self.featureDeleted.emit(fid)
+
+    def set_geom_quiet(self, fid, geom):
+        self._feats[fid]._g = geom  # без сигналов (состояние до отката)
+
+
+def _square(x0, y0, x1, y1):
+    return QgsGeometry.fromPolygonXY([ring((x0, y0), (x1, y0),
+                                           (x1, y1), (x0, y1))])
+
+
+def _grid_geoms():
+    """Сетка 2x2 (ячейка 10): узел (10,10) общий у 4 фич."""
+    return [_square(0, 0, 10, 10), _square(10, 0, 20, 10),
+            _square(0, 10, 10, 20), _square(10, 10, 20, 20)]
+
+
+lyr33 = _IndexLyr(_grid_geoms(), lid="grid33")
+idx33 = ti.TopologyIndex(lyr33)
+
+# --- узлы: сетка и NodeRef -------------------------------------------------
+refs33 = idx33.nodes_at(pt(10, 10))
+check("33 узлы: узел (10,10) найден во всех 4 фичах",
+      len(refs33) == 4 and {r.fid for r in refs33} == {1, 2, 3, 4})
+check("33 узлы: NodeRef несёт позицию и структуру",
+      all(abs(r.point.x() - 10.0) < 1e-9 and
+          abs(r.point.y() - 10.0) < 1e-9 for r in refs33) and
+      all(r.layer_id == "grid33" and r.part == 0 and r.ring == 0
+          for r in refs33))
+check("33 узлы: вне узла — пусто",
+      idx33.nodes_at(pt(5, 5)) == [] and
+      len(idx33.nodes_at(pt(10, 10), eps=0.5)) == 4)
+
+# --- рёбра ------------------------------------------------------------------
+edges33 = idx33.edges_near(pt(5, 0))
+check("33 рёбра: ребро (0,0)-(10,0) найдено",
+      len(edges33) == 1 and edges33[0].fid == 1 and
+      abs(edges33[0].a.x() - 0.0) < 1e-9 and
+      abs(edges33[0].b.x() - 10.0) < 1e-9)
+edges33v = idx33.edges_near(pt(10, 5))
+check("33 рёбра: вертикальное ребро x=10 есть у обеих смежных фич",
+      {e.fid for e in edges33v} == {1, 2})
+check("33 рёбра: точка вдали от рёбер — пусто",
+      idx33.edges_near(pt(5, 5)) == [])
+
+# --- features_touching / bbox_features / снимки / соседи ---------------------
+touch33 = idx33.features_touching(pt(10, 10))
+check("33 touching: узел задевает 4 фичи, ключ — layer_id",
+      touch33 == {"grid33": [1, 2, 3, 4]})
+bbox33 = idx33.bbox_features(QgsRectangle(11, 11, 19, 19))
+check("33 bbox: внутренний прямоугольник — только фича 4",
+      bbox33 == {"grid33": [4]})
+snap33 = idx33.snapshot_geometry(lyr33, 4)
+check("33 снимок: norm_polys фичи 4 (5 точек, одиночный)",
+      snap33 is not None and snap33[1] is False and
+      len(snap33[0][0][0]) == 5)
+nbrs33 = idx33.neighbors(4)
+check("33 соседи: у фичи 4 три соседа по узлу (10,10)",
+      nbrs33 == {"grid33": [1, 2, 3]})
+
+# --- хирургическая инвалидация: geometryChanged ------------------------------
+_orig33 = _grid_geoms()
+
+
+def _move_node(geom, old, new):
+    """Новая геометрия квадрата с вершиной old -> new (замена копий)."""
+    polys, was_multi = gu.norm_polys(geom)
+    new_polys, _cnt = gu.replace_vertices(
+        polys, pt(old[0], old[1]), pt(new[0], new[1]), 1e-12)
+    return gu.polys_to_geom(new_polys, was_multi)
+
+
+for fid33 in (1, 2, 3, 4):
+    lyr33.change_geom(fid33, _move_node(_orig33[fid33 - 1],
+                                        (10, 10), (12, 9)))
+check("33 surgery: старого узла (10,10) больше нет",
+      idx33.nodes_at(pt(10, 10)) == [])
+check("33 surgery: новый узел (12,9) найден в 4 фичах",
+      len(idx33.nodes_at(pt(12, 9))) == 4)
+check("33 surgery: индекс равен полной пересборке",
+      idx33.check_integrity() == [])
+
+# --- featureAdded / featureDeleted -------------------------------------------
+lyr33.add_geom(5, _square(30, 30, 40, 40))
+check("33 добавление: новая фича видна узлам и bbox-поиску",
+      len(idx33.nodes_at(pt(30, 30))) == 1 and
+      idx33.bbox_features(QgsRectangle(31, 31, 39, 39)) ==
+      {"grid33": [5]})
+check("33 добавление: целостность сохранена",
+      idx33.check_integrity() == [])
+lyr33.del_geom(5)
+check("33 удаление: фича исчезла из индекса",
+      idx33.nodes_at(pt(30, 30)) == [] and
+      idx33.bbox_features(QgsRectangle(31, 31, 39, 39)) is not None and
+      idx33.bbox_features(QgsRectangle(31, 31, 39, 39))["grid33"] == [] and
+      idx33.check_integrity() == [])
+
+# --- afterRollBack: плитки bbox последней операции ----------------------------
+# габарит операции — НОВЫЕ и СТАРЫЕ положения затронутых фич (как
+# пишет редактор): узел (10,10)->(12,9) трогает фичи 1-4, их габариты
+# (0,0)-(20,20); плитки, пересекающие этот bbox, инвалидируются целиком
+ut.note_operation_bbox(lyr33, QgsRectangle(0, 0, 20, 20))
+for fid33 in (1, 2, 3, 4):
+    lyr33.set_geom_quiet(fid33, _orig33[fid33 - 1])  # откат БЕЗ сигналов
+lyr33.afterRollBack.emit()
+check("33 откат: узел (10,10) вернулся (плитки bbox пересобраны)",
+      len(idx33.nodes_at(pt(10, 10))) == 4 and
+      idx33.nodes_at(pt(12, 9)) == [])
+check("33 откат: индекс равен полной пересборке",
+      idx33.check_integrity() == [])
+
+# откат без сведений в журнале — полная пересборка
+for fid33 in (1, 2, 3, 4):
+    lyr33.change_geom(fid33, _move_node(_orig33[fid33 - 1],
+                                        (10, 10), (12, 9)))
+ut.note_operation_bbox(lyr33, None)  # журнал очищен
+for fid33 in (1, 2, 3, 4):
+    lyr33.set_geom_quiet(fid33, _orig33[fid33 - 1])
+lyr33.afterRollBack.emit()
+check("33 откат без сведений: полная пересборка вернула узел",
+      len(idx33.nodes_at(pt(10, 10))) == 4 and
+      idx33.check_integrity() == [])
+
+# --- editingStopped: полный сброс ---------------------------------------------
+lyr33.change_geom(1, _move_node(_orig33[0], (10, 10), (12, 9)))
+lyr33.editingStopped.emit()
+check("33 стоп правки: плитки сброшены, данные пересобираются лениво",
+      idx33._tiles == {} and
+      len(idx33.nodes_at(pt(10, 10))) == 3 and  # фича 1 увела узел
+      len(idx33.nodes_at(pt(12, 9))) == 1 and
+      idx33.check_integrity() == [])
+
+# --- бюджет сборки: плитка не строится, редактор идёт прямым запросом ---------
+_budget_s, _budget_every = ti.TILE_BUILD_BUDGET_S, ti._BUDGET_CHECK_EVERY
+try:
+    ti.TILE_BUILD_BUDGET_S, ti._BUDGET_CHECK_EVERY = 0.0, 1
+    lyr33b = _IndexLyr(_grid_geoms(), lid="grid33b")
+    idx33b = ti.TopologyIndex(lyr33b)
+    served33b = idx33b.ensure_for(QgsRectangle(0, 0, 20, 20))
+    check("33 бюджет: плитка помечена несобранной",
+          len(idx33b._failed) >= 1 and idx33b._tiles == {})
+    check("33 бюджет: агрегированные запросы честно возвращают None",
+          idx33b.bbox_features(QgsRectangle(0, 0, 20, 20)) is None and
+          idx33b.features_near_points([pt(10, 10)]) is None)
+    ed33b = te.TopoEditor(None, lyr33b)
+    rep33b = ed33b.move_vertex(pt(10, 10), pt(11, 11))
+    check("33 бюджет: редактор работает прямым запросом (узел перемещён)",
+          rep33b.get("error") is None and rep33b.get("moved") == 4)
+finally:
+    ti.TILE_BUILD_BUDGET_S, ti._BUDGET_CHECK_EVERY = _budget_s, _budget_every
+
+# --- целостность ловит порчу ---------------------------------------------------
+tk33 = sorted(idx33._tiles.keys())[0]
+idx33._tiles[tk33].snapshots.pop(1, None)
+check("33 целостность: пропавший снимок обнаружен",
+      len(idx33.check_integrity()) == 1)
+idx33._dirty.add(tk33)
+idx33.nodes_at(pt(10, 10))  # обращение пересобирает грязную плитку
+check("33 целостность: после пересборки расхождений нет",
+      idx33.check_integrity() == [])
+
+# --- фича на стыке плиток -------------------------------------------------------
+import topopolyedit.settings as st33  # noqa: E402
+lyr33c = _IndexLyr(_grid_geoms(), lid="grid33c")
+idx33c = ti.TopologyIndex(lyr33c)
+_tf33 = st33.tile_factor
+try:
+    st33.tile_factor = lambda: 0.5
+    idx33c.seed_extent(QgsRectangle(0, 0, 20, 20))  # сетка плиток 10x10
+    check("33 стык плиток: узел на углу 4 плиток найден во всех фичах",
+          len(idx33c.nodes_at(pt(10, 10))) == 4 and
+          idx33c.check_integrity() == [] and
+          len(idx33c._tiles) == 4)
+finally:
+    st33.tile_factor = _tf33
+
+# --- настройка «индекс включён» и реестр ----------------------------------------
+_on33 = st33.index_enabled
+lyr33e = _IndexLyr(_grid_geoms(), lid="grid33e")  # свежий слой для реестра
+try:
+    st33.index_enabled = lambda: False
+    check("33 настройка: индекс выключен — index_for_layer даёт None",
+          ti.index_for_layer(lyr33e) is None)
+finally:
+    st33.index_enabled = _on33
+idxA33 = ti.index_for_layer(lyr33e)
+idxB33 = ti.index_for_layer(lyr33e)
+check("33 реестр: индекс создаётся один раз и переиспользуется",
+      idxA33 is not None and idxA33 is idxB33)
+check("33 реестр: drop_index снимает подписки и удаляет из реестра",
+      ti.drop_index(lyr33e) and lyr33e.geometryChanged._slots == [] and
+      "grid33e" not in ti._registry)
+
+# --- лимит соседей из настроек (ТЗ этап 3, п. 7: 5000 по умолчанию) -------------
+check("33 лимит: константа редактора = 5000 (было 500)",
+      te.MAX_OVERLAP_NEIGHBORS == 5000 and
+      st33.DEFAULT_MAX_NEIGHBORS == 5000)
+# наполнители ВНУТРИ bbox запроса (в углу фичи 4 — перехлёст легитимно
+# остаётся: режим по умолчанию «спрашивать» без диалога = оставить)
+_fill33 = [_square(19.0 + i * 0.2, 19.0, 19.15 + i * 0.2, 19.15)
+           for i in range(6)]
+lyr33d = _IndexLyr(_grid_geoms() + _fill33, lid="grid33d")
+_lim33 = st33.max_overlap_neighbors
+try:
+    st33.max_overlap_neighbors = lambda: 3
+    ed33d = te.TopoEditor(None, lyr33d)
+    rep33d = ed33d.move_vertex(pt(10, 10), pt(11, 11))
+    check("33 лимит: превышение даёт явное сообщение с числом",
+          rep33d.get("error") is not None and
+          "больше 3" in rep33d["error"] and
+          rep33d.get("moved", 0) == 0)
+    check("33 лимит: слой битово цел при отказе",
+          gu.norm_polys(lyr33d.getFeature(1).geometry())[0] ==
+          gu.norm_polys(_orig33[0])[0])
+finally:
+    st33.max_overlap_neighbors = _lim33
+
+# очистка журнала/реестра секции
+ti.shutdown_all()
+ut.note_operation_bbox(lyr33, None)
 
 # ---------------------------------------------------------------------------
 print("")

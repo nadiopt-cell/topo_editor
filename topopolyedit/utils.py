@@ -129,6 +129,62 @@ def resolve_edit_layer(iface, offer_start=True, quiet=False):
 
 _last_edited_ref = []
 
+# Журнал ПОСЛЕДНЕЙ операции плагина по слоям (этап 3 ТЗ): layer_id ->
+# (QgsRectangle, порядковый номер). Нужен для afterRollBack индекса
+# топологии: сигнал отката не сообщает затронутые фичи, и инвалидация
+# идёт по плиткам, пересекающим bbox последней операции (ТЗ этап 3, п. 3).
+_last_op_bbox = {}
+_last_op_seq = [0]
+
+
+def note_operation_bbox(layer, rect):
+    """Запоминает габарит последней операции плагина на слое.
+
+    rect должен накрывать НОВЫЕ и СТАРЫЕ положения затронутых фич
+    (тогда откат операции восстановит геометрии в пределах этого
+    габарита). Ссылка на rect копируется; слой не хранится (только id).
+    """
+    try:
+        lid = layer.id()
+        if rect is None:
+            _last_op_bbox.pop(lid, None)
+            return
+        _last_op_seq[0] += 1
+        _last_op_bbox[lid] = (_copy_rect(rect), _last_op_seq[0])
+    except Exception:
+        pass
+
+
+def last_operation_bbox_by_id(layer_id):
+    """Габарит последней операции плагина на слое (QgsRectangle | None).
+
+    Индекс топологии зовёт этот метод в afterRollBack (ТЗ этап 3, п. 3).
+    """
+    try:
+        entry = _last_op_bbox.get(layer_id)
+        if entry is None:
+            return None
+        rect = _copy_rect(entry[0])
+        return rect
+    except Exception:
+        return None
+
+
+def reset_operation_journal():
+    """Полная очистка журнала операций (тесты, сброс сеанса)."""
+    try:
+        _last_op_bbox.clear()
+        _last_op_seq[0] = 0
+    except Exception:
+        pass
+
+
+def _copy_rect(rect):
+    """Копия QgsRectangle (grow/combineExtentWith изменяют на месте)."""
+    from qgis.core import QgsRectangle as _QR
+    return _QR(rect.xMinimum(), rect.yMinimum(),
+               rect.xMaximum(), rect.yMaximum())
+
 
 def note_edited_layer(layer):
     """Запоминает последний слой, изменённый плагином (для «Отменить»).

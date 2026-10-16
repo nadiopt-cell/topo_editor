@@ -29,6 +29,7 @@ from .topo_edge_move_tool import TopoEdgeMoveTool
 from .topo_add_vertex_tool import TopoAddVertexTool
 from .audit_overlay import NodeAuditOverlay
 from .settings_dialog import SettingsDialog
+from . import topology_index
 from . import settings
 from . import utils
 
@@ -283,6 +284,11 @@ class TopoPolyEditPlugin(object):
 
     # ------------------------------------------------------------------
     def unload(self):
+        # индекс топологии (этап 3): снять все подписки на сигналы слоёв
+        try:
+            topology_index.shutdown_all()
+        except Exception:
+            pass
         # горячая клавиша Ctrl+Z: снять с канвы до удаления обработчика
         if self._undo_shortcut is not None:
             try:
