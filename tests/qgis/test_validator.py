@@ -29,7 +29,8 @@ from topopolyedit.core.validator import (
     GeosValidity, NoSpikes, NoSameLayerOverlap, NoNewGaps,
     SharedBoundaryPreserved,
     SEV_ERROR, SEV_WARNING,
-    CODE_SELF_INTERSECTION, CODE_SPIKE, CODE_DUP_VERTEX,
+    CODE_SELF_INTERSECTION, CODE_INVALID,
+    CODE_SPIKE, CODE_DUP_VERTEX,
     CODE_OVERLAP, CODE_NEW_GAP, CODE_SHARED_BOUNDARY,
 )
 
