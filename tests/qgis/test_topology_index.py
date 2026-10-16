@@ -31,7 +31,7 @@ from qgis.core import (
 from fixtures_data import (
     make_cadastral_layer,
     make_grid_layer,
-    make_tjunction_layer,
+    make_single_polygon_layer,
 )
 from topology_asserts import assert_topology_ok
 
@@ -249,23 +249,51 @@ def test_external_add_delete_reflected(editor_keep):
 # Интеграция с операциями этапов 1–2 через индекс
 # ---------------------------------------------------------------------------
 
+def _poly_geom(pts):
+    """[(x, y), ...] -> замкнутый полигон QgsGeometry."""
+    ring = [QgsPointXY(x, y) for x, y in pts]
+    ring.append(QgsPointXY(ring[0]))
+    return QgsGeometry.fromPolygonXY([ring])
+
+
 def test_tjunction_move_via_index(editor_keep):
-    """T-примыкание обрабатывается индексным поиском: узел B на ребре A
-    тянет ребро A (залатывание), оба полигона двигаются."""
-    layer, tags = make_tjunction_layer()
+    """T-примыкание обрабатывается индексным поиском: у A НЕТ вершины
+    в точке узла B, A находится поиском ребра под точкой (index edges),
+    залатывается и двигается вместе с B (moved == 2).
+
+    Геометрия — «открытое T»: ребро B заканчивается ОБЩЕЙ вершиной A
+    (20,10). Иначе (ребро B продолжается за конец ребра A) сдвиг T-узла
+    рождает клин между прямым ребром B и согнутым ребром A — такие
+    операции валидатор честно блокирует (этап 1; см. докстринг
+    test_t_junction.py), и приёмка «оба полигона двигаются» на такой
+    геометрии недостижима по определению."""
+    layer = make_single_polygon_layer("t_index")
+    for tag, geom in [
+        ("A", _poly_geom([(0, 0), (20, 0), (20, 10), (0, 10)])),
+        ("B", _poly_geom([(5, 10), (20, 10), (20, 20)])),
+    ]:
+        f = QgsFeature(layer.fields())
+        f.setGeometry(geom)
+        f.setAttribute("id", tag)
+        assert layer.dataProvider().addFeatures([f])
     layer.startEditing()
     try:
-        ed = editor_keep(layer)
-        rep = ed.move_vertex(_pt(5, 10), _pt(5, 11))
-        assert rep.get("error") is None, rep
-        assert rep["moved"] == 2  # A (T-залатывание) + B
         idx = tindex.index_for_layer(layer)
         assert idx is not None
+        # индекс находит ОБА полигона: B по вершине, A по ребру под точкой
+        near = idx.features_near_points([_pt(5, 10)], 1e-6)
+        assert near is not None and len(near) == 2, near
+        ed = editor_keep(layer)
+        rep = ed.move_vertex(_pt(5, 10), _pt(8, 13))
+        assert rep.get("error") is None, rep
+        assert rep["moved"] == 2, rep  # A (T-залатывание) + B
         assert idx.check_integrity() == []
-        geoms = {f.id(): f.geometry() for f in layer.getFeatures()}
-        for fid in geoms.values():
-            nr = norm_polys(fid)
-            assert contains_vertex(nr[0], _pt(5, 11), 1e-6)
+        geoms = {f2["id"]: f2.geometry() for f2 in layer.getFeatures()}
+        assert set(geoms) == {"A", "B"}
+        for tag, g in geoms.items():
+            nr = norm_polys(g)
+            assert contains_vertex(nr[0], _pt(8, 13), 1e-6), tag
+        assert_topology_ok(layer, holes_before=0, msg="t-index")
     finally:
         layer.rollBack()
 
@@ -319,8 +347,9 @@ def test_api_nodes_edges_neighbors(editor_keep):
         assert idx is not None
         idx.ensure_for(layer.extent())
 
-        # узлы: (10,10) — общий угол участков (0,0),(1,0),(0,1),(1,1)
-        refs = idx.nodes_at(_pt(10, 10))
+        # узлы: общий угол участков (0,0),(1,0),(0,1),(1,1). В кадастре
+        # внутренние узлы сдвинуты (PERTURBED): узел (1,1) = (10.3, 10.2)
+        refs = idx.nodes_at(_pt(10.3, 10.2))
         assert {r.fid for r in refs} == {
             tags[(0, 0)], tags[(1, 0)], tags[(0, 1)], tags[(1, 1)]}
         assert all(r.layer_id == layer.id() for r in refs)
@@ -330,7 +359,7 @@ def test_api_nodes_edges_neighbors(editor_keep):
         assert edges and all(e.fid == tags[(0, 0)] for e in edges)
 
         # touching + bbox
-        touch = idx.features_touching(_pt(10, 10))
+        touch = idx.features_touching(_pt(10.3, 10.2))
         assert set(touch[layer.id()]) == {
             tags[(0, 0)], tags[(1, 0)], tags[(0, 1)], tags[(1, 1)]}
         bbox = idx.bbox_features(layer.extent())

@@ -834,8 +834,15 @@ class TopoEditor(object):
             try:
                 neighbors = self._same_layer_neighbors(bbox,
                                                        set(exclude_ids))
+            except RuntimeError as exc:
+                # Лимит соседей (ТЗ этап 3, п. 7): явное сообщение,
+                # операция не выполняется — слой не тронут. Проглатывать
+                # нельзя: валидация без соседей пропустила бы потерю
+                # общих узлов и новые щели.
+                report["error"] = str(exc)
+                return report
             except Exception:
-                neighbors = []  # лимит соседей — проверка по затронутым
+                neighbors = []  # индекс/слой не ответили — проверка по затронутым
         old_geoms = self._old_geoms(set(final.keys()))
         neighbors_for_validation = [
             (f, g) for f, g in neighbors if f not in final]
