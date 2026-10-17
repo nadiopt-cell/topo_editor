@@ -223,3 +223,29 @@ def geom_area(g):
         return float(g.area())
     except Exception:
         return 0.0
+
+
+def as_point(obj):
+    """QgsPointXY из того, что возвращают pointOnSurface()/centroid().
+
+    ВАЖНО: в PyQGIS QgsGeometry.pointOnSurface() и centroid()
+    возвращают QgsGeometry (точку-геометрию), а не QgsPointXY —
+    прямой вызов .x() на результате даёт AttributeError. Здесь
+    принимается и QgsPointXY, и QgsGeometry (через asPoint())."""
+    if obj is None:
+        return None
+    if isinstance(obj, QgsPointXY):
+        return obj
+    try:
+        pt = obj.asPoint()
+    except Exception:
+        return None
+    if pt is None:
+        return None
+    try:
+        import math
+        if math.isnan(pt.x()) or math.isnan(pt.y()):
+            return None
+    except Exception:
+        return None
+    return QgsPointXY(pt)

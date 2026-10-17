@@ -15,7 +15,7 @@ from qgis.core import QgsPointXY, QgsRectangle
 
 from .base import (
     Finding, CODE_OVERLAP, _cancelled, _progress, _opts, _geoms,
-    candidate_fids, geom_area,
+    candidate_fids, geom_area, as_point,
 )
 
 
@@ -84,13 +84,12 @@ class OverlapCheck(object):
 
 
 def _rep_point(g):
-    """Точка-ориентир геометрии: pointOnSurface, иначе центроид габарита."""
+    """Точка-ориентир геометрии: pointOnSurface (QgsGeometry! —
+    нормализуем через base.as_point), иначе центр габарита."""
     try:
-        p = g.pointOnSurface()
+        p = as_point(g.pointOnSurface())
         if p is not None:
-            import math
-            if not (math.isnan(p.x()) or math.isnan(p.y())):
-                return QgsPointXY(p)
+            return p
     except Exception:
         pass
     try:

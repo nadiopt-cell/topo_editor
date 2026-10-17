@@ -33,7 +33,7 @@ from qgis.core import (
 
 from .base import (
     Finding, CODE_GAP, _cancelled, _progress, _opts, _polys, _geoms,
-    candidate_fids,
+    candidate_fids, as_point,
 )
 
 # целевое число фич в объединении одной плитки (10 000 -> 5x5 плиток)
@@ -319,7 +319,10 @@ class GapCheck(object):
 
     @staticmethod
     def _rep_point(hole, ring):
-        """Представительская точка щели (строго внутри)."""
+        """Представительская точка щели (строго внутри).
+
+        pointOnSurface()/centroid() в PyQGIS возвращают QgsGeometry
+        (точку-геометрию) — нормализуем через base.as_point()."""
         cand = []
         try:
             cand.append((u"pointOnSurface", hole.pointOnSurface()))
@@ -329,20 +332,17 @@ class GapCheck(object):
             cand.append((u"centroid", hole.centroid()))
         except Exception as exc:
             _dbg(u"rep: centroid сбой: {}".format(exc))
-        for name, p in cand:
+        for name, obj in cand:
+            p = as_point(obj)
             if p is None:
-                _dbg(u"rep: {} -> None".format(name))
+                _dbg(u"rep: {} -> нет точки".format(name))
                 continue
             try:
-                if math.isnan(p.x()) or math.isnan(p.y()):
-                    _dbg(u"rep: {} -> NaN".format(name))
-                    continue
-                ok = hole.contains(QgsGeometry.fromPointXY(
-                    QgsPointXY(p)))
+                ok = hole.contains(QgsGeometry.fromPointXY(p))
                 _dbg(u"rep: {} = ({:g},{:g}) contains={}"
                      .format(name, p.x(), p.y(), ok))
                 if ok:
-                    return QgsPointXY(p)
+                    return p
             except Exception as exc:
                 _dbg(u"rep: {} contains сбой: {}".format(name, exc))
                 continue
