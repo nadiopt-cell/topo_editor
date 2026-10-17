@@ -25,13 +25,14 @@
 """
 
 import math
+import os
 
 from qgis.core import (
     QgsGeometry, QgsPointXY, QgsRectangle, QgsWkbTypes,
 )
 
 from .base import (
-    Finding, CODE_GAP, _cancelled, _progress, _opts, _geoms,
+    Finding, CODE_GAP, _cancelled, _progress, _opts, _polys, _geoms,
     candidate_fids,
 )
 
@@ -40,6 +41,12 @@ _TILE_TARGET = 500
 _TILE_MAX_DIM = 16
 # минимальная длина общей границы, чтобы фича считалась соседом щели
 _SHARED_MIN_LEN = 1e-9
+
+
+def _dbg(message):
+    """Диагностика GAP под env-флагом (в CI виден captured stdout)."""
+    if os.environ.get("TOPOPOLEDIT_GAP_DEBUG") == "1":
+        print("[topopolyedit][gap] {}".format(message))
 
 
 def _rect_empty(r):
@@ -55,6 +62,65 @@ def _rect_empty(r):
         return r.width() <= 0.0 or r.height() <= 0.0
     except Exception:
         return False
+
+
+def _seg_overlap_len(a1, a2, b1, b2, eps):
+    """Длина перекрытия коллинеарных сегментов (a1,a2) и (b1,b2).
+
+    Сегменты считаются лежащими на одной прямой, если концы b
+    отстоят от прямой a не дальше eps; перекрытие — по проекциям
+    на направление a. Неколлинеарные — 0."""
+    dx = a2.x() - a1.x()
+    dy = a2.y() - a1.y()
+    length = math.hypot(dx, dy)
+    if length <= eps:
+        return 0.0
+    cross1 = dx * (b1.y() - a1.y()) - dy * (b1.x() - a1.x())
+    cross2 = dx * (b2.y() - a1.y()) - dy * (b2.x() - a1.x())
+    if abs(cross1) > eps * length or abs(cross2) > eps * length:
+        return 0.0
+    t1 = ((b1.x() - a1.x()) * dx + (b1.y() - a1.y()) * dy) \
+        / (length * length)
+    t2 = ((b2.x() - a1.x()) * dx + (b2.y() - a1.y()) * dy) \
+        / (length * length)
+    lo = max(min(t1, t2), 0.0)
+    hi = min(max(t1, t2), 1.0)
+    if hi <= lo:
+        return 0.0
+    return (hi - lo) * length
+
+
+def _ring_segments(ring):
+    """Сегменты замкнутого/незамкнутого списка точек."""
+    out = []
+    for i in range(len(ring) - 1):
+        out.append((ring[i], ring[i + 1]))
+    return out
+
+
+def _shared_boundary_len(polys, hole_ring, eps):
+    """Суммарная длина колец структуры polys, лежащая НА границе щели
+    (коллинеарные перекрытия сегментов; дубли границ дают сумму —
+    для выбора соседа это не критично, у смежных фич она одна)."""
+    if not polys:
+        return 0.0
+    border = _ring_segments(hole_ring)
+    if not border:
+        return 0.0
+    total = 0.0
+    for _pi, _ri, ring in _iter_rings_g(polys):
+        for a1, a2 in _ring_segments(ring):
+            for b1, b2 in border:
+                ov = _seg_overlap_len(a1, a2, b1, b2, eps)
+                if ov > 0.0:
+                    total += ov
+    return total
+
+
+def _iter_rings_g(polys):
+    for part in polys or []:
+        for ring in part:
+            yield None, None, ring
 
 
 class GapCheck(object):
@@ -146,8 +212,13 @@ class GapCheck(object):
         try:
             parts = (union.asMultiPolygon() if union.isMultipart()
                      else [union.asPolygon()])
-        except Exception:
+        except Exception as exc:
+            _dbg(u"плитка: asMultiPolygon сбой: {}".format(exc))
             return
+        n_holes = sum(len(part) - 1 for part in parts)
+        if n_holes:
+            _dbg(u"плитка: {} частей, {} дыр".format(len(parts),
+                                                     n_holes))
         seam_ratio = float(_opts(ctx, "seam_min_ratio") or 0.0)
         gap_max = float(_opts(ctx, "gap_max_area") or 0.0)
         for part in parts:
@@ -170,6 +241,7 @@ class GapCheck(object):
             return
         rep = self._rep_point(hole, ring)
         if rep is None:
+            _dbg(u"дыра {:g}: нет представительской точки".format(area))
             return
         # дедупликация: представительская точка уже внутри найденной
         for acc_pt, acc_geom in accepted:
@@ -193,6 +265,7 @@ class GapCheck(object):
                 pass
             local.append(g)
         if len(local) < 2:
+            _dbg(u"дыра {:g}: локальных фич {}".format(area, len(local)))
             return
         try:
             local_union = QgsGeometry.unaryUnion(local)
@@ -205,31 +278,26 @@ class GapCheck(object):
                 return  # дыру закрывает фича вне плитки — не щель
         except Exception:
             return
-        # соседи по общей границе
-        try:
-            hole_border = hole.boundary()
-        except Exception:
-            return
-        if hole_border is None or hole_border.isNull() \
-                or hole_border.isEmpty():
-            return
+        # соседи по общей границе: сумма коллинеарных перекрытий
+        # сегментов колец фичи с границей щели (без GEOS boundary() —
+        # он давал тихие сбои в CI; чистая математика над кольцами)
+        eps = float(_opts(ctx, "match_eps") or 1e-6)
         adj = []  # (длина общей границы, fid)
         for fid in sorted(set(candidate_fids(ctx, rect))):
             g = lookup.get(fid)
             if g is None:
                 continue
             try:
-                border = g.boundary()
-                if border is None or border.isNull():
-                    continue
-                shared = border.intersection(hole_border)
-                length = shared.length() if shared is not None \
-                    and not shared.isNull() else 0.0
-            except Exception:
+                length = _shared_boundary_len(_polys(ctx, fid, g),
+                                              ring, eps)
+            except Exception as exc:
+                _dbg(u"дыра: shared #{} сбой: {}".format(fid, exc))
                 continue
             if length > _SHARED_MIN_LEN:
                 adj.append((length, fid))
         if len(adj) < 2:
+            _dbg(u"дыра {:g}: соседей по границе {} (нужно 2+)"
+                 .format(area, len(adj)))
             return  # дегенерация или собственная дыра фичи
         min_adj_area = min(lookup[f].area() for _l, f in adj
                            if f in lookup) if adj else 0.0
