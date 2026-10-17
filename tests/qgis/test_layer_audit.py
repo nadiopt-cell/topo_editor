@@ -175,7 +175,7 @@ def test_seeded_layer_all_codes_found():
                                           fids["overlap_b"]}
     assert abs(overlaps[0].area - 50.0) < 1e-6
     assert abs(pl["area_a"] - 100.0) < 1e-6
-    assert abs(pl["area_b"] - 225.0) < 1e-6
+    assert abs(pl["area_b"] - 150.0) < 1e-6  # 10 x 15
 
     dups = by.get(CODE_DUP_NODE, [])
     assert len(dups) == 1 and dups[0].fid == fids["dup"], dups

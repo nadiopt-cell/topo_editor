@@ -39,6 +39,30 @@ from .findings_overlay import FindingsOverlay, severity_color, \
 
 ALL_CODES_ITEM = u"Все коды"
 
+
+def _exec(dialog):
+    """Диалоговый exec: PyQt6 — exec(), PyQt5 — exec_()."""
+    try:
+        return dialog.exec()
+    except AttributeError:
+        return dialog.exec_()
+
+
+def _sbtn(name):
+    """QMessageBox.StandardButton.<name> для Qt5/Qt6."""
+    try:
+        return utils.enum_member(QMessageBox, "StandardButton", name)
+    except Exception:
+        return None
+
+
+def _brole(name):
+    """QMessageBox.ButtonRole.<name> для Qt5/Qt6."""
+    try:
+        return utils.enum_member(QMessageBox, "ButtonRole", name)
+    except Exception:
+        return None
+
 # колонки таблицы
 _COLS = [u"Код", u"Слой", u"fid", u"X", u"Y", u"Площадь", u"Сообщение"]
 
@@ -280,6 +304,15 @@ class AuditDock(QgsDockWidget):
 
     def _refill(self):
         rows = self._filtered()
+        # Qt5/Qt6: UserRole и GlobalColor.darkRed — через enum_member
+        try:
+            user_role = utils.enum_member(Qt, "ItemDataRole", "UserRole")
+        except Exception:
+            user_role = 256  # Qt.UserRole в Qt5
+        try:
+            dark_red = utils.enum_member(Qt, "GlobalColor", "darkRed")
+        except Exception:
+            dark_red = None
         self.table.setRowCount(len(rows))
         for i, f in enumerate(rows):
             vals = [
@@ -295,10 +328,10 @@ class AuditDock(QgsDockWidget):
             ]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(v)
-                item.setData(Qt.UserRole, i)
-                if c == 0 and not f.fixable:
+                item.setData(user_role, i)
+                if c == 0 and not f.fixable and dark_red is not None:
                     try:
-                        item.setForeground(Qt.darkRed)
+                        item.setForeground(dark_red)
                     except Exception:
                         pass
                 self.table.setItem(i, c, item)
@@ -441,12 +474,12 @@ class AuditDock(QgsDockWidget):
                             finding.payload.get("a_fid"),
                             finding.payload.get("b_fid"),
                             finding.area or 0.0))
-            b_small = box.addButton(
-                u"Обрезать меньший", QMessageBox.YesRole)
-            b_large = box.addButton(
-                u"Обрезать больший", QMessageBox.NoRole)
-            box.addButton(u"Не исправлять", QMessageBox.RejectRole)
-            box.exec_()
+            b_small = box.addButton(u"Обрезать меньший",
+                                    _brole("YesRole"))
+            b_large = box.addButton(u"Обрезать больший",
+                                    _brole("NoRole"))
+            box.addButton(u"Не исправлять", _brole("RejectRole"))
+            _exec(box)
             clicked = box.clickedButton()
             if clicked is b_small:
                 return "smaller"
@@ -470,9 +503,11 @@ class AuditDock(QgsDockWidget):
                 u"отменяется одним Ctrl+Z.".format(
                     area_before, area_after,
                     abs(area_after - area_before)))
-            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            box.setDefaultButton(QMessageBox.No)
-            return box.exec_() == QMessageBox.Yes
+            yes, no = _sbtn("Yes"), _sbtn("No")
+            if yes is not None and no is not None:
+                box.setStandardButtons(yes | no)
+                box.setDefaultButton(no)
+            return _exec(box) == yes
         except Exception:
             return False
 
@@ -537,8 +572,10 @@ class AuditDock(QgsDockWidget):
             box.setWindowTitle(u"Сохранить в GeoPackage")
             box.setText(u"Слой «{}» добавлен в проект. Сохранить его в "
                         u"GeoPackage?".format(vl.name()))
-            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            if box.exec_() != QMessageBox.Yes:
+            yes, no = _sbtn("Yes"), _sbtn("No")
+            if yes is not None and no is not None:
+                box.setStandardButtons(yes | no)
+            if _exec(box) != yes:
                 return
             path, _flt = QFileDialog.getSaveFileName(
                 self, u"Файл GeoPackage", u"audit_errors.gpkg",

@@ -174,7 +174,8 @@ class FixEngine(object):
         for finding in batch_sorted:
             try:
                 ch = self._apply_finding(finding, work, overlap_decider,
-                                         makevalid_decider)
+                                         makevalid_decider,
+                                         changed_fids=set(changes.keys()))
             except FixRefused as exc:
                 # осознанный отказ: находка устарела, пользователь
                 # отклонил, щель уже закрыта пачкой — не ошибка
@@ -327,7 +328,7 @@ class FixEngine(object):
     # ------------------------------------------------------------------
 
     def _apply_finding(self, finding, work, overlap_decider,
-                       makevalid_decider):
+                       makevalid_decider, changed_fids=None):
         """ChangeSet одного исправления по payload; FixRefused — отказ."""
         code = finding.code
         payload = finding.payload or {}
@@ -350,7 +351,7 @@ class FixEngine(object):
         if code == CODE_GAP:
             return fixes.glue_gap(work, payload.get("gap_geom"),
                                   payload.get("neighbor_fid"),
-                                  changed_fids=set(changes.keys()))
+                                  changed_fids=changed_fids)
         if code == CODE_OVERLAP:
             choice = None
             if overlap_decider is not None:
