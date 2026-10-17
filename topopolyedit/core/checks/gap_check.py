@@ -228,15 +228,19 @@ class GapCheck(object):
 
     def _check_hole(self, ctx, ring, lookup, accepted, out,
                     seam_ratio, gap_max):
+        _dbg(u"_check_hole: кольцо из {} точек".format(len(ring or [])))
         if len(ring) < 4:
             return
         try:
             hole = QgsGeometry.fromPolygonXY([ring])
-        except Exception:
+        except Exception as exc:
+            _dbg(u"_check_hole: fromPolygonXY сбой: {}".format(exc))
             return
         if hole.isNull() or hole.isEmpty():
+            _dbg(u"_check_hole: дыра пуста/null")
             return
         area = hole.area()
+        _dbg(u"_check_hole: площадь {:g}".format(area))
         if area <= 0.0:
             return
         rep = self._rep_point(hole, ring)
@@ -269,14 +273,19 @@ class GapCheck(object):
             return
         try:
             local_union = QgsGeometry.unaryUnion(local)
-        except Exception:
+        except Exception as exc:
+            _dbg(u"_check_hole: local_union сбой: {}".format(exc))
             return
         if local_union is None or local_union.isNull():
+            _dbg(u"_check_hole: local_union null")
             return
         try:
             if local_union.contains(QgsGeometry.fromPointXY(rep)):
+                _dbg(u"_check_hole: дыра {:g} ПОКРЫТА локальным "
+                     u"объединением — не щель".format(area))
                 return  # дыру закрывает фича вне плитки — не щель
-        except Exception:
+        except Exception as exc:
+            _dbg(u"_check_hole: contains сбой: {}".format(exc))
             return
         # соседи по общей границе: сумма коллинеарных перекрытий
         # сегментов колец фичи с границей щели (без GEOS boundary() —
@@ -299,6 +308,8 @@ class GapCheck(object):
             _dbg(u"дыра {:g}: соседей по границе {} (нужно 2+)"
                  .format(area, len(adj)))
             return  # дегенерация или собственная дыра фичи
+        _dbg(u"дыра {:g}: соседи {}".format(
+            area, [(round(l, 4), f) for l, f in adj]))
         min_adj_area = min(lookup[f].area() for _l, f in adj
                            if f in lookup) if adj else 0.0
         if seam_ratio > 0.0 and area <= seam_ratio * max(min_adj_area,
