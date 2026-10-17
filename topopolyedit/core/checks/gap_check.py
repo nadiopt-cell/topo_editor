@@ -322,24 +322,35 @@ class GapCheck(object):
         """Представительская точка щели (строго внутри)."""
         cand = []
         try:
-            cand.append(hole.pointOnSurface())
-        except Exception:
-            pass
+            cand.append((u"pointOnSurface", hole.pointOnSurface()))
+        except Exception as exc:
+            _dbg(u"rep: pointOnSurface сбой: {}".format(exc))
         try:
-            cand.append(hole.centroid())
-        except Exception:
-            pass
-        for p in cand:
+            cand.append((u"centroid", hole.centroid()))
+        except Exception as exc:
+            _dbg(u"rep: centroid сбой: {}".format(exc))
+        for name, p in cand:
             if p is None:
+                _dbg(u"rep: {} -> None".format(name))
                 continue
             try:
                 if math.isnan(p.x()) or math.isnan(p.y()):
+                    _dbg(u"rep: {} -> NaN".format(name))
                     continue
-                if hole.contains(QgsGeometry.fromPointXY(
-                        QgsPointXY(p))):
+                ok = hole.contains(QgsGeometry.fromPointXY(
+                    QgsPointXY(p)))
+                _dbg(u"rep: {} = ({:g},{:g}) contains={}"
+                     .format(name, p.x(), p.y(), ok))
+                if ok:
                     return QgsPointXY(p)
-            except Exception:
+            except Exception as exc:
+                _dbg(u"rep: {} contains сбой: {}".format(name, exc))
                 continue
+        if ring:
+            _dbg(u"rep: кольцо {} точек, первая=({:g},{:g}) "
+                 u"последняя=({:g},{:g})".format(
+                     len(ring), ring[0].x(), ring[0].y(),
+                     ring[-1].x(), ring[-1].y()))
         return None
 
     @staticmethod
