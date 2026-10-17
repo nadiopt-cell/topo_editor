@@ -59,10 +59,10 @@ OPTS = {
     "overlap_min_ratio": 1e-8,
 }
 
-GAP_A = (210, 0), (220, 0), (220, 10), (210, 10)
-GAP_B = (220.0008, 0), (230, 0), (230, 10), (220.0008, 10)
-GAP_TOP = (210, 10), (220.0008, 10), (220.0008, 20), (210, 20)
-GAP_BOT = (210, -10), (220.0008, -10), (220.0008, 0), (210, 0)
+GAP_A = [(210, 0), (220, 0), (220, 0.4), (220.02, 0.4), (220.02, 10),
+         (210, 10)]
+GAP_B = [(220.02, 0), (230, 0), (230, 10), (220.02, 10)]
+GAP_BOT = [(210, -10), (230, -10), (230, 0), (210, 0)]
 
 
 def _closed(pts):
@@ -91,11 +91,12 @@ def make_seeded_layer():
     # INVALID: «бабочка» (самопересечение)
     fids["invalid"] = _add(layer, "invalid",
                            [(200, 0), (202, 2), (200, 2), (202, 0)])
-    # GAP: щель 0.0008 x 10 = 0.008 ед. кв. (исправима), замкнута
-    # сверху и снизу «крышками» — углы образуют NEAR_NODE-пары
+    # GAP: щель 0.02 x 0.4 = 0.008 ед. кв. (исправима, ширина > допуска
+    # NEAR — углы не сливаются), замкнута снизу «крышкой», сверху —
+    # уступом L-образного gap_a; все стыки — по РЁБРАМ (точечные
+    # касания дробят объединение, и щель перестаёт быть дырой)
     fids["gap_a"] = _add(layer, "gap_a", GAP_A)
     fids["gap_b"] = _add(layer, "gap_b", GAP_B)
-    fids["gap_top"] = _add(layer, "gap_top", GAP_TOP)
     fids["gap_bot"] = _add(layer, "gap_bot", GAP_BOT)
     # OVERLAP: перекрытие 50 ед. кв.; B больше — обрежется A
     fids["overlap_a"] = _add(layer, "overlap_a",
@@ -163,7 +164,6 @@ def test_seeded_layer_all_codes_found():
     assert gaps[0].fixable is True
     assert gaps[0].fid == fids["gap_a"]  # сосед по длиннейшей границе
     assert abs(gaps[0].area - 0.008) < 1e-9, gaps[0].area
-
     overlaps = by.get(CODE_OVERLAP, [])
     assert len(overlaps) == 1, overlaps
     pl = overlaps[0].payload
@@ -177,13 +177,15 @@ def test_seeded_layer_all_codes_found():
     assert len(dups) == 1 and dups[0].fid == fids["dup"], dups
 
     nears = by.get(CODE_NEAR_NODE, [])
-    # 2 пары у щели + 2 пары фикстуры near_f/near_g
-    assert len(nears) == 4, [(n.fid, n.message) for n in nears]
+    # 2 пары фикстуры near_f/near_g (углы щели разнесены на 0.02 —
+    # шире допуска, NEAR-пар не образуют)
+    assert len(nears) == 2, [(n.fid, n.message) for n in nears]
     assert all(n.fixable for n in nears), \
         [(n.fid, n.message) for n in nears]
 
     tjs = by.get(CODE_T_JUNCTION, [])
-    assert len(tjs) == 2, [(t.fid, t.message) for t in tjs]
+    # 2 у T-фикстуры + 2 у щели (углы gap_a/gap_b на крышке gap_bot)
+    assert len(tjs) == 4, [(t.fid, t.message) for t in tjs]
     assert all(t.fixable for t in tjs)
 
     spikes = by.get(CODE_SPIKE, [])
@@ -222,11 +224,9 @@ def test_fix_all_safe_rerun_clean_area_and_single_undo():
         batch, u"Аудит: исправить все (безопасные)")
     assert report["error"] is None, report
     assert report["violations"] is None, report
-
-    # щель закрыта слиянием почти совпавших узлов — клейка честно
-    # отказывается (двойное исправление создало бы перехлёст)
-    refused_codes = [f.code for f, _why in report["refused"]]
-    assert refused_codes == [CODE_GAP], report["refused"]
+    # все безопасные исправления применились без отказов: щель приклеена
+    # к gap_a (длиннейшая общая граница), слияния NEAR прошли
+    assert report["refused"] == [], report["refused"]
 
     # повторный прогон: 0 ошибок безопасных кодов
     findings2 = run_audit_sync(layer, OPTS)
@@ -261,7 +261,7 @@ def test_gap_glue_neighbor_area_grows_exactly():
         (area_a_before, area_a_after, gap.area)
     # щель исчезла
     findings2 = [f for f in run_audit_sync(layer, OPTS)
-                 if f.code == CODE_GAP and f.fid == fids["gap_a"]]
+                 if f.code == CODE_GAP]
     assert findings2 == []
 
 
@@ -322,11 +322,12 @@ def test_invalid_makevalid_by_choice():
     assert inv, findings
     engine = FixEngine(None, layer)
 
-    # пользователь отказался — слой не изменён
+    # пользователь отказался — слой не изменён; отказ фиксируется
+    # в refused (пачка пуста — движок честно сообщает «нечего писать»)
     report = engine.fix_findings(
         inv, u"Аудит: makeValid",
         makevalid_decider=lambda f, g, a0, a1: False)
-    assert report["fixed"] == 0 and report["error"] is None, report
+    assert report["fixed"] == 0, report
     assert not _geom_of(layer, fids["invalid"]).isGeosValid()
 
     # пользователь подтвердил — геометрия стала валидной

@@ -37,8 +37,10 @@ CHECK_CLASSES = (InvalidCheck(), GapCheck(), OverlapCheck(),
 def run_checks(ctx):
     """Прогоняет все проверки по контексту; возвращает [Finding].
 
-    Сбой отдельной проверки — запись в журнал «TopoPolyEdit», остальные
-    проверки продолжаются (аудит не должен умирать целиком)."""
+    Сбой отдельной проверки — запись в журнал «TopoPolyEdit» И В STDOUT
+    (pytest-qgis показывает captured stdout только при падении — без
+    print() проглоченный сбой проверки в CI не виден). Остальные
+    проверки продолжаются: аудит не должен умирать целиком."""
     findings = []
     for check in CHECK_CLASSES:
         if ctx.get("cancelled") and ctx["cancelled"]():
@@ -46,8 +48,11 @@ def run_checks(ctx):
         try:
             findings.extend(check.run(ctx) or [])
         except Exception as exc:
-            log(u"Аудит слоя: проверка {} не удалась — {}".format(
-                getattr(check, "CODE", check.__class__.__name__), exc))
+            name = getattr(check, "CODE", check.__class__.__name__)
+            log(u"Аудит слоя: проверка {} не удалась — {}".format(name,
+                                                                  exc))
+            print("[topopolyedit] аудит: проверка {} не удалась: "
+                  "{}: {}".format(name, type(exc).__name__, exc))
     findings.sort(key=lambda f: (f.code, f.fid if f.fid is not None
                                  else -1))
     return findings

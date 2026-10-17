@@ -170,24 +170,31 @@ class FixEngine(object):
         changes = {}
         work = dict(geoms)
         applied = []
+        had_crash = False
         for finding in batch_sorted:
             try:
                 ch = self._apply_finding(finding, work, overlap_decider,
                                          makevalid_decider)
             except FixRefused as exc:
+                # осознанный отказ: находка устарела, пользователь
+                # отклонил, щель уже закрыта пачкой — не ошибка
                 report["refused"].append((finding, str(exc)))
                 continue
             except Exception as exc:
                 report["refused"].append(
                     (finding, u"сбой применения: {}".format(exc)))
+                had_crash = True
                 continue
             for fid, g in ch.items():
                 work[fid] = g
                 changes[fid] = g
             applied.append(finding)
         if not changes:
-            report["refused"] = report["refused"]
-            report["error"] = u"ни одно исправление не применимо"
+            if had_crash:
+                report["error"] = (u"ни одно исправление не применимо "
+                                   u"(есть сбои применения — см. "
+                                   u"отказы)")
+            # иначе все отказы осознанные — причина в refused
             return report
 
         # --- валидация плана ДО записи (слой битово цел при отказе) ---
@@ -312,7 +319,6 @@ class FixEngine(object):
         except Exception:
             pass
         report["fixed"] = len(changes)
-        report["refused"] = report["refused"]
         report["area_change_pct"] = pct
         return report
 
