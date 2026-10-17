@@ -19,6 +19,8 @@ Finding — одна найденная ошибка: код, слой, fid, т�
 Модуль зависит только от qgis.core — без qgis.gui.
 """
 
+from qgis.core import QgsPointXY  # noqa: F401  (as_point ниже)
+
 from ...geo_utils import norm_polys, TOPO_MATCH_EPS
 
 # --- коды ошибок (ТЗ этап 5, таблица проверок) ---------------------------
