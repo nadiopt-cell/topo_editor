@@ -188,8 +188,12 @@ def test_seeded_layer_all_codes_found():
         [(n.fid, n.message) for n in nears]
 
     tjs = by.get(CODE_T_JUNCTION, [])
-    # 2 у T-фикстуры + 2 у щели (углы gap_a/gap_b на крышке gap_bot)
-    assert len(tjs) == 4, [(t.fid, t.message) for t in tjs]
+    # 7 честных T-примыканий: 2 у T-фикстуры (345,10)/(360,10);
+    # 3 у щели (углы gap_a/gap_b на крышке gap_bot и излом gap_a
+    # (220.02,0.4) на ребре gap_b); 2 у перехлёста (углы (245,10) и
+    # (250,10) на чужих верхних рёбрах — перекрывающиеся прямоугольники
+    # неизбежно дают T на стыке)
+    assert len(tjs) == 7, [(t.fid, t.message) for t in tjs]
     assert all(t.fixable for t in tjs)
 
     spikes = by.get(CODE_SPIKE, [])

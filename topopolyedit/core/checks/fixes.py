@@ -260,7 +260,7 @@ def glue_gap(layer_geoms, gap_geom, neighbor_fid, changed_fids=None):
         except Exception:
             pass  # проверить не удалось — клейка идёт как есть
     try:
-        merged = g.union(gap_geom)
+        merged = g.combine(gap_geom)  # PyQGIS 3: union = combine()
     except Exception as exc:
         raise FixRefused(u"сбой объединения со щелью: {}".format(exc))
     m = _polygon_only(merged)
