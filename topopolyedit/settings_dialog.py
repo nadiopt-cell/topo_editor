@@ -281,6 +281,87 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp_multi)
 
         # --------------------------------------------------------------
+        # Аудит слоя (этап 5 ТЗ): пороги проверок и исправлений
+        # --------------------------------------------------------------
+        grp_audit = QGroupBox(u"Аудит слоя (пороги проверок)", self)
+        ax = QVBoxLayout(grp_audit)
+
+        row_gap = QHBoxLayout()
+        row_gap.addWidget(QLabel(
+            u"Исправимая щель до (ед. СК²):", grp_audit))
+        self.spn_gap_area = QDoubleSpinBox(grp_audit)
+        self.spn_gap_area.setDecimals(4)
+        self.spn_gap_area.setRange(settings.MIN_GAP_MAX_AREA,
+                                   settings.MAX_GAP_MAX_AREA)
+        self.spn_gap_area.setSingleStep(0.01)
+        self.spn_gap_area.setValue(settings.gap_max_area())
+        self.spn_gap_area.setToolTip(
+            u"GAP_MAX_AREA: щели с площадью до этого порога исправимы\n"
+            u"(«приклеить» к соседу), больше — только показ. По\n"
+            u"умолчанию 0,01 (100 см² в метрических СК). До этапа 7 —\n"
+            u"единицы СК слоя.")
+        row_gap.addWidget(self.spn_gap_area, 1)
+        ax.addLayout(row_gap)
+
+        row_near = QHBoxLayout()
+        row_near.addWidget(QLabel(
+            u"Допуск «почти совпавших» узлов:", grp_audit))
+        self.spn_near_tol = QDoubleSpinBox(grp_audit)
+        self.spn_near_tol.setDecimals(4)
+        self.spn_near_tol.setRange(settings.MIN_NEAR_TOL,
+                                   settings.MAX_NEAR_TOL)
+        self.spn_near_tol.setSingleStep(0.005)
+        self.spn_near_tol.setValue(settings.near_node_tol())
+        self.spn_near_tol.setToolTip(
+            u"NEAR_NODE_TOL: узлы разных полигонов ближе этого допуска\n"
+            u"(но не совпадающие) — находка NEAR_NODE; слив в центроид\n"
+            u"только если рёбра короткие или коллинеарные. По умолчанию\n"
+            u"0,01 (1 см в метрических СК).")
+        row_near.addWidget(self.spn_near_tol, 1)
+        ax.addLayout(row_near)
+
+        row_slv = QHBoxLayout()
+        row_slv.addWidget(QLabel(u"Порог сливера (площадь/периметр²):",
+                                 grp_audit))
+        self.spn_sliver = QDoubleSpinBox(grp_audit)
+        self.spn_sliver.setDecimals(8)
+        self.spn_sliver.setRange(settings.MIN_SLIVER_RATIO,
+                                 settings.MAX_SLIVER_RATIO)
+        self.spn_sliver.setSingleStep(0.00001)
+        self.spn_sliver.setValue(settings.sliver_ratio())
+        self.spn_sliver.setToolTip(
+            u"SLIVER_RATIO: у вытянутого «лоскута» площадь/периметр²\n"
+            u"ниже порога (по умолчанию 0,0001). У квадрата 0,0625.\n"
+            u"Исправления нет — только показ.")
+        row_slv.addWidget(self.spn_sliver, 1)
+        ax.addLayout(row_slv)
+
+        row_pct = QHBoxLayout()
+        row_pct.addWidget(QLabel(
+            u"Порог изменения площади при исправлении, %:", grp_audit))
+        self.spn_fix_pct = QDoubleSpinBox(grp_audit)
+        self.spn_fix_pct.setDecimals(4)
+        self.spn_fix_pct.setRange(settings.MIN_FIX_AREA_PCT,
+                                  settings.MAX_FIX_AREA_PCT)
+        self.spn_fix_pct.setSingleStep(0.001)
+        self.spn_fix_pct.setValue(settings.fix_area_change_pct())
+        self.spn_fix_pct.setToolTip(
+            u"Если пачка исправлений меняет суммарную площадь слоя\n"
+            u"больше этого процента — пачка отказывается целиком\n"
+            u"(по умолчанию 0,001 % — клейка мелких щелей проходит,\n"
+            u"крупные ошибки формы требуют ручной работы).")
+        row_pct.addWidget(self.spn_fix_pct, 1)
+        ax.addLayout(row_pct)
+
+        audit_hint = QLabel(
+            u"Проверка всего слоя идёт в фоне (QgsTask) с прогрессом и\n"
+            u"отменой; результаты — в панели «Аудит слоя…» с таблицей,\n"
+            u"переходом на место и экспортом в точечный слой.", grp_audit)
+        audit_hint.setWordWrap(True)
+        ax.addWidget(audit_hint)
+        lay.addWidget(grp_audit)
+
+        # --------------------------------------------------------------
         # Кнопки
         # --------------------------------------------------------------
         row_btn = QHBoxLayout()
@@ -510,6 +591,11 @@ class SettingsDialog(QDialog):
         self.chk_index.setChecked(settings.DEFAULT_INDEX_ON)
         self.spn_neighbors.setValue(settings.DEFAULT_MAX_NEIGHBORS)
         self.spn_tile.setValue(settings.DEFAULT_TILE_FACTOR)
+        # этап 5: пороги аудита
+        self.spn_gap_area.setValue(settings.DEFAULT_GAP_MAX_AREA)
+        self.spn_near_tol.setValue(settings.DEFAULT_NEAR_NODE_TOL)
+        self.spn_sliver.setValue(settings.DEFAULT_SLIVER_RATIO)
+        self.spn_fix_pct.setValue(settings.DEFAULT_FIX_AREA_PCT)
         # этап 4: все слои в правке, без исключений, отсечение — как раньше
         self.rb_scope_all.setChecked(True)
         for i in range(self.lst_edit_excl.count()):
@@ -553,6 +639,12 @@ class SettingsDialog(QDialog):
             else settings.EDIT_SCOPE_ALL)
         settings.set_edit_disabled(self._edit_exclusion_ids())
         self._clip_mode_changed(0)
+        # этап 5: пороги аудита слоя
+        settings.set_audit_thresholds(
+            gap_max_area=self.spn_gap_area.value(),
+            near_node_tol=self.spn_near_tol.value(),
+            sliver_ratio=self.spn_sliver.value(),
+            fix_area_pct=self.spn_fix_pct.value())
         return ok
 
     def accept(self):

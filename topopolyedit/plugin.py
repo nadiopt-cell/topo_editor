@@ -10,6 +10,10 @@
   * «Аудит узлов» — вершины редактируемого слоя и слоёв прилипания
     одновременно, контрастными цветами; красные крестики — узлы общей
     границы без пары на другой стороне (топологические ошибки);
+  * «Аудит слоя…» — пакетный поиск ошибок всего слоя (невалидные
+    геометрии, щели, перехлёсты, дубли вершин, почти совпавшие узлы,
+    T-примыкания, шипы, сливеры) в фоне с таблицей, переходом на
+    место, экспортом и безопасным исправлением одной командой отмены;
   * «Отменить правку» — откат последней операции плагина целиком;
     работает, даже если редактируемый слой не активен (штатная отмена
     QGIS привязана к активному слою и с модулем часто остаётся серой);
@@ -28,6 +32,7 @@ from .topo_move_tool import TopoMoveTool
 from .topo_edge_move_tool import TopoEdgeMoveTool
 from .topo_add_vertex_tool import TopoAddVertexTool
 from .audit_overlay import NodeAuditOverlay
+from .audit_panel import AuditDock
 from .settings_dialog import SettingsDialog
 from . import topology_index
 from . import operation_log as oplog
@@ -85,6 +90,16 @@ TOOLTIP_AUDIT = (
     u"картина обновляется при пан/зуме и правках слоя. Состояние\n"
     u"запоминается между сеансами QGIS.")
 
+TOOLTIP_LAYER_AUDIT = (
+    u"Аудит слоя: поиск и исправление ошибок\n\n"
+    u"Пакетная проверка всего слоя (в фоне, с прогрессом и отменой):\n"
+    u"невалидные геометрии, щели, перехлёсты, дубли вершин, почти\n"
+    u"совпавшие узлы, T-примыкания без узла, шипы, сливеры. Таблица\n"
+    u"ошибок с фильтром и переходом на место (двойной клик),\n"
+    u"выгрузка в точечный слой. «Исправить все (безопасные)» —\n"
+    u"дубли, T-примыкания, безопасные слияния узлов и клейка щелей\n"
+    u"одной командой отмены, через валидатор.")
+
 
 class TopoPolyEditPlugin(object):
     """Класс плагина, инициализируемый через classFactory."""
@@ -98,11 +113,13 @@ class TopoPolyEditPlugin(object):
         self.act_undo = None
         self._undo_shortcut = None
         self.act_audit = None
+        self.act_layer_audit = None
         self.act_settings = None
         self.tool_move = None
         self.tool_edge = None
         self.tool_add = None
         self.audit = None
+        self.audit_dock = None
 
     # ------------------------------------------------------------------
     def initGui(self):
@@ -112,6 +129,8 @@ class TopoPolyEditPlugin(object):
         icon_add = QIcon(os.path.join(base, "icons", "topo_add_vertex.svg"))
         icon_undo = QIcon(os.path.join(base, "icons", "topo_undo.svg"))
         icon_audit = QIcon(os.path.join(base, "icons", "topo_audit.svg"))
+        icon_layer_audit = QIcon(os.path.join(
+            base, "icons", "topo_layer_audit.svg"))
         icon_settings = QIcon(os.path.join(base, "icons",
                                            "topo_settings.svg"))
 
@@ -147,13 +166,20 @@ class TopoPolyEditPlugin(object):
         self.act_audit.setToolTip(TOOLTIP_AUDIT)
         self.act_audit.triggered.connect(self._on_audit_triggered)
 
+        self.act_layer_audit = QAction(icon_layer_audit, u"Аудит слоя…",
+                                       self.iface.mainWindow())
+        self.act_layer_audit.setToolTip(TOOLTIP_LAYER_AUDIT)
+        self.act_layer_audit.triggered.connect(
+            self._on_layer_audit_triggered)
+
         self.act_settings = QAction(icon_settings, u"Настройки прилипания…",
                                     self.iface.mainWindow())
         self.act_settings.setToolTip(TOOLTIP_SETTINGS)
         self.act_settings.triggered.connect(self._on_settings_triggered)
 
         for act in (self.act_move, self.act_edge, self.act_add,
-                    self.act_undo, self.act_audit, self.act_settings):
+                    self.act_undo, self.act_audit, self.act_layer_audit,
+                    self.act_settings):
             self.toolbar.addAction(act)
             self.iface.addPluginToVectorMenu(MENU_TITLE, act)
 
@@ -333,6 +359,45 @@ class TopoPolyEditPlugin(object):
             except Exception:
                 continue
 
+    def _on_layer_audit_triggered(self):
+        """«Аудит слоя…»: открыть/показать док-панель аудита (этап 5)."""
+        try:
+            if self.audit_dock is None:
+                self.audit_dock = AuditDock(self.iface,
+                                            self.iface.mainWindow())
+            dock = self.audit_dock
+            try:
+                dock.setAllowedAreas(
+                    utils.enum_member(Qt, "DockWidgetArea",
+                                      "LeftDockWidgetArea")
+                    | utils.enum_member(Qt, "DockWidgetArea",
+                                        "RightDockWidgetArea")
+                    | utils.enum_member(Qt, "DockWidgetArea",
+                                        "BottomDockWidgetArea"))
+            except Exception:
+                pass
+            if dock.parent() is None:
+                try:
+                    area = utils.enum_member(Qt, "DockWidgetArea",
+                                             "RightDockWidgetArea")
+                    self.iface.addDockWidget(area, dock)
+                except Exception:
+                    pass
+            dock.show()
+            dock.raise_()
+            try:
+                dock._fill_layers()
+            except Exception:
+                pass
+        except Exception as exc:
+            self.iface.messageBar().pushMessage(
+                MENU_TITLE,
+                u"Не удалось открыть аудит слоя: {}".format(exc),
+                level=Qgis.Critical, duration=5)
+            self.iface.messageBar().pushMessage(
+                MENU_TITLE, u"Подробности — в журнале «TopoPolyEdit»",
+                level=Qgis.Info, duration=4)
+
     def _on_settings_triggered(self):
         try:
             dlg = SettingsDialog(self.iface, self.iface.mainWindow())
@@ -355,6 +420,18 @@ class TopoPolyEditPlugin(object):
             oplog.clear()
         except Exception:
             pass
+        # док-панель аудита слоя (этап 5): остановить задачу, снять
+        # оверлей и удалить панель
+        if self.audit_dock is not None:
+            try:
+                self.audit_dock.shutdown()
+            except Exception:
+                pass
+            try:
+                self.audit_dock.deleteLater()
+            except Exception:
+                pass
+            self.audit_dock = None
         # горячая клавиша Ctrl+Z: снять с канвы до удаления обработчика
         if self._undo_shortcut is not None:
             try:
@@ -387,7 +464,8 @@ class TopoPolyEditPlugin(object):
             except Exception:
                 pass
         for act in (self.act_move, self.act_edge, self.act_add,
-                    self.act_undo, self.act_audit, self.act_settings):
+                    self.act_undo, self.act_audit, self.act_layer_audit,
+                    self.act_settings):
             if act is None:
                 continue
             try:

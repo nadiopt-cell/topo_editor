@@ -596,6 +596,118 @@ def tile_factor():
     return min(max(value, MIN_TILE_FACTOR), MAX_TILE_FACTOR)
 
 
+# ----------------------------------------------------------------------
+# Аудит слоя (этап 5 ТЗ): пороги проверок и исправлений. До этапа 7
+# метрические пороги задаются в единицах СК слоя («Пороги по умолчанию»
+# ТЗ: «до него — единицы СК»).
+# ----------------------------------------------------------------------
+
+# пороги аудита слоя (этап 5 ТЗ)
+KEY_GAP_MAX_AREA = SNAP_SECTION + "/audit_gap_max_area"
+KEY_NEAR_NODE_TOL = SNAP_SECTION + "/audit_near_node_tol"
+KEY_SLIVER_RATIO = SNAP_SECTION + "/audit_sliver_ratio"
+KEY_FIX_AREA_PCT = SNAP_SECTION + "/audit_fix_area_pct"
+
+DEFAULT_GAP_MAX_AREA = 0.01    # GAP_MAX_AREA_M2: до этапа 7 — ед. СК²
+DEFAULT_NEAR_NODE_TOL = 0.01   # NEAR_NODE_TOL_M: 1 см (ед. СК до этапа 7)
+DEFAULT_SLIVER_RATIO = 1e-4    # SLIVER_RATIO: площадь / периметр²
+DEFAULT_FIX_AREA_PCT = 0.001   # порог «площадь изменилась заметно», %
+
+MIN_GAP_MAX_AREA = 1e-9
+MAX_GAP_MAX_AREA = 1e6
+MIN_NEAR_TOL = 1e-9
+MAX_NEAR_TOL = 100.0
+MIN_SLIVER_RATIO = 1e-9
+MAX_SLIVER_RATIO = 1.0
+MIN_FIX_AREA_PCT = 1e-6
+MAX_FIX_AREA_PCT = 100.0
+
+
+def _audit_float(key, default, lo, hi):
+    """Читает порог аудита; мусор/NaN/inf — значение по умолчанию."""
+    qs = _qsettings()
+    if qs is None:
+        return default
+    try:
+        value = float(qs.value(key, default, type=float))
+    except Exception:
+        return default
+    if value != value or value in (float("inf"), float("-inf")):
+        return default
+    return min(max(value, lo), hi)
+
+
+def gap_max_area():
+    """Максимальная площадь исправимой щели (GAP_MAX_AREA, этап 5 ТЗ).
+
+    Щели больше порога — только показ; меньше SEAM_MIN_RATIO × площадь
+    меньшего соседа — «шов», игнорируется. По умолчанию 0.01 ед. СК²."""
+    return _audit_float(KEY_GAP_MAX_AREA, DEFAULT_GAP_MAX_AREA,
+                        MIN_GAP_MAX_AREA, MAX_GAP_MAX_AREA)
+
+
+def near_node_tol():
+    """Допуск «почти совпавших» узлов (NEAR_NODE_TOL, этап 5 ТЗ).
+
+    Больше допуска совпадения (TOPO_MATCH_EPS), по умолчанию 0.01
+    ед. СК слоя (1 см в метрических СК)."""
+    return _audit_float(KEY_NEAR_NODE_TOL, DEFAULT_NEAR_NODE_TOL,
+                        MIN_NEAR_TOL, MAX_NEAR_TOL)
+
+
+def sliver_ratio():
+    """Порог сливера (SLIVER_RATIO, этап 5 ТЗ): площадь / периметр²."""
+    return _audit_float(KEY_SLIVER_RATIO, DEFAULT_SLIVER_RATIO,
+                        MIN_SLIVER_RATIO, MAX_SLIVER_RATIO)
+
+
+def fix_area_change_pct():
+    """Порог изменения суммарной площади слоя при исправлениях, %
+    (критерий приёмки этапа 5; по умолчанию 0,001 %)."""
+    return _audit_float(KEY_FIX_AREA_PCT, DEFAULT_FIX_AREA_PCT,
+                        MIN_FIX_AREA_PCT, MAX_FIX_AREA_PCT)
+
+
+def audit_opts():
+    """Готовый словарь opts для core.checks.run_layer_checks()."""
+    return {
+        "gap_max_area": gap_max_area(),
+        "near_node_tol": near_node_tol(),
+        "sliver_ratio": sliver_ratio(),
+        "seam_min_ratio": seam_min_ratio(),
+        "spike_min_angle_deg": spike_min_angle_deg(),
+        "match_eps": edit_match_eps(None),
+    }
+
+
+def set_audit_thresholds(gap_max_area=None, near_node_tol=None,
+                         sliver_ratio=None, fix_area_pct=None):
+    """Сохраняет пороги аудита (None — не менять). Сбои не фатальны."""
+    qs = _qsettings()
+    if qs is None:
+        return False
+    try:
+        if gap_max_area is not None:
+            qs.setValue(KEY_GAP_MAX_AREA, float(
+                min(max(float(gap_max_area), MIN_GAP_MAX_AREA),
+                    MAX_GAP_MAX_AREA)))
+        if near_node_tol is not None:
+            qs.setValue(KEY_NEAR_NODE_TOL, float(
+                min(max(float(near_node_tol), MIN_NEAR_TOL),
+                    MAX_NEAR_TOL)))
+        if sliver_ratio is not None:
+            qs.setValue(KEY_SLIVER_RATIO, float(
+                min(max(float(sliver_ratio), MIN_SLIVER_RATIO),
+                    MAX_SLIVER_RATIO)))
+        if fix_area_pct is not None:
+            qs.setValue(KEY_FIX_AREA_PCT, float(
+                min(max(float(fix_area_pct), MIN_FIX_AREA_PCT),
+                    MAX_FIX_AREA_PCT)))
+        return True
+    except Exception:
+        return False
+
+
 def clip_mode_for(layer_id):
     """Per-layer режим отсечения перехлёстов (этап 4 ТЗ, п. 7).
 

@@ -3476,6 +3476,182 @@ check("34 multi-одиночный: один слой — moved=2, команд�
       mE.ends == 1 and mE.destroyed == 0)
 
 # ---------------------------------------------------------------------------
+# Секция 35: аудит слоя — проверки и исправления ядра (этап 5 ТЗ).
+# Проверки DUP/SPIKE/SLIVER/NEAR/T — чистая математика, работают на
+# стабах; GAP/OVERLAP требуют GEOS (unaryUnion) — здесь проверяется
+# только деградация без исключений, полная приёмка в tests/qgis.
+# ---------------------------------------------------------------------------
+import topopolyedit.core.checks as checks35
+from topopolyedit.core.checks.base import (
+    CODE_DUP_NODE as C35_DUP, CODE_GAP as C35_GAP,
+    CODE_OVERLAP as C35_OVERLAP, CODE_NEAR_NODE as C35_NEAR,
+    CODE_T_JUNCTION as C35_T, CODE_SPIKE as C35_SPIKE,
+    CODE_SLIVER as C35_SLIVER, CODE_INVALID as C35_INVALID,
+    SAFE_FIX_CODES as C35_SAFE, Finding as Finding35,
+)
+from topopolyedit.core.checks import fixes as fixes35
+
+
+def _ring35(pts):
+    r = [pt(x, y) for x, y in pts]
+    if r[0] != r[-1]:
+        r.append(pt(r[0].x(), r[0].y()))
+    return r
+
+
+def _poly35(pts):
+    return gu.QgsGeometry.fromPolygonXY([_ring35(pts)])
+
+
+def _ctx35(*geoms, **kw):
+    return {
+        "geoms": [(i + 1, g) for i, g in enumerate(geoms)],
+        "polys": {}, "index": None,
+        "opts": dict(kw.get("opts") or {}),
+        "progress": None, "cancelled": None,
+        "layer_id": "L35", "layer_name": "L35",
+    }
+
+
+def _codes35(findings):
+    return sorted(set(f.code for f in findings))
+
+
+def _raises35(fn):
+    try:
+        fn()
+        return False
+    except fixes35.FixRefused:
+        return True
+
+
+# DUP_NODE: находка и чистка
+g35_dup = _poly35([(0, 0), (10, 0), (10 + 5e-9, 0), (10, 10), (0, 10)])
+f35 = checks35.DupNodeCheck().run(_ctx35(g35_dup))
+check("35 DUP: дубль вершин найден (одна находка, fid верный)",
+      len(f35) == 1 and f35[0].fid == 1 and f35[0].fixable)
+if f35 and f35[0].fixable:
+    ch35 = fixes35.clean_dup_nodes({1: g35_dup}, 1, 1e-6)
+    np35 = gu.norm_polys(ch35[1])[0]
+    check("35 DUP: после чистки 5 вершин (кольцо замкнуто, форма та же)",
+          len(np35[0][0]) == 5 and
+          np35[0][0][0] == pt(0, 0) and np35[0][0][-1] == pt(0, 0))
+    check("35 DUP: чистка уже чистой геометрии отказана (FixRefused)",
+          _raises35(lambda: fixes35.clean_dup_nodes({1: ch35[1]}, 1,
+                                                    1e-6)))
+
+
+# SPIKE: игла, удаление острия, отказ на треугольнике
+g35_spike = _poly35([(0, 0), (10, 0), (10, 10), (5, 10), (5, 15),
+                     (5.0001, 10), (0, 10)])
+f35 = checks35.SpikeCheck().run(_ctx35(g35_spike))
+check("35 SPIKE: остриё иглы найдено, payload несёт площадь иглы",
+      len(f35) == 1 and f35[0].fixable and
+      abs(f35[0].payload["pos"][0] - 5) < 1e-12 and
+      abs(f35[0].payload["spike_area"] - 0.00025) < 1e-9)
+if f35:
+    ch35 = fixes35.remove_spike_vertex({1: g35_spike},
+                                       f35[0].payload["pos"], 1e-6)
+    np35 = gu.norm_polys(ch35[1])[0]
+    check("35 SPIKE: после удаления кольцо без острия (7 точек)",
+          len(np35[0][0]) == 7)
+tri35 = _poly35([(0, 0), (10, 0), (20, 0.0001)])
+f35 = checks35.SpikeCheck().run(_ctx35(tri35))
+check("35 SPIKE: у тонкого треугольника >= 1 острый угол",
+      len(f35) >= 1)
+check("35 SPIKE: удаление из треугольника отказано (кольцо выродится)",
+      f35 and _raises35(lambda: fixes35.remove_spike_vertex(
+          {1: tri35}, f35[0].payload["pos"], 1e-6)))
+
+# SLIVER: отношение площадь/периметр^2
+f35 = checks35.SliverCheck().run(_ctx35(_poly35([(0, 0), (100, 0),
+                                                 (0, 0.05)])))
+check("35 SLIVER: вытянутый треугольник найден, исправления нет",
+      len(f35) == 1 and f35[0].fixable is False)
+check("35 SLIVER: квадрат не помечен",
+      checks35.SliverCheck().run(
+          _ctx35(_poly35([(0, 0), (10, 0), (10, 10), (0, 10)]))) == [])
+
+# NEAR_NODE: безопасный кластер (коллинеарные продолжения)
+g35_a = _poly35([(40, 0), (50, 0), (50, 10), (40, 10)])
+g35_b = _poly35([(50, 10.001), (60, 10.001), (60, 20), (50, 20)])
+f35 = checks35.NearNodeCheck().run(_ctx35(g35_a, g35_b))
+check("35 NEAR: кластер найден, слияние безопасно",
+      len(f35) == 1 and f35[0].fixable and
+      f35[0].payload["safe"] is True)
+if f35 and f35[0].fixable:
+    pl35 = f35[0].payload
+    ch35 = fixes35.merge_near_cluster({1: g35_a, 2: g35_b},
+                                      pl35["positions"],
+                                      pl35["centroid"], 1e-6)
+    ca35 = pl35["centroid"]
+    pa35 = gu.norm_polys(ch35[1])[0][0][0]
+    pb35 = gu.norm_polys(ch35[2])[0][0][0]
+    has_a = any(abs(p.x() - ca35[0]) < 1e-6 and
+                abs(p.y() - ca35[1]) < 1e-6 for p in pa35)
+    has_b = any(abs(p.x() - ca35[0]) < 1e-6 and
+                abs(p.y() - ca35[1]) < 1e-6 for p in pb35)
+    check("35 NEAR: после слива оба полигона содержат центроид",
+          set(ch35.keys()) == {1, 2} and has_a and has_b)
+
+# NEAR_NODE: длинные неколлинеарные рёбра — только показ
+g35_c = _poly35([(40, 40), (50, 40), (50, 50), (40, 50)])
+g35_d = _poly35([(50.001, 50), (60, 55), (55, 49)])
+f35 = checks35.NearNodeCheck().run(_ctx35(g35_c, g35_d))
+check("35 NEAR: неколлинеарный кластер — только показ",
+      len(f35) == 1 and f35[0].fixable is False and
+      f35[0].payload["safe"] is False)
+
+# NEAR_NODE: совпадающие узлы (общая топология) кластером не считаются
+g35_e = _poly35([(70, 0), (80, 0), (80, 10), (70, 10)])
+g35_f = _poly35([(80, 0), (90, 0), (90, 10), (80, 10)])
+check("35 NEAR: точно совпавшие общие узлы — не находка",
+      checks35.NearNodeCheck().run(_ctx35(g35_e, g35_f)) == [])
+
+# T_JUNCTION: вершина на чужом ребре; вставка во ВСЕ фичи с ребром
+g35_t = _poly35([(0, 0), (20, 0), (20, 10), (0, 10)])
+g35_u = _poly35([(5, 10), (25, 10), (25, 20), (5, 20)])
+f35 = checks35.TJunctionCheck().run(_ctx35(g35_t, g35_u))
+check("35 T: оба примыкания найдены (2 находки, payload с рёбрами)",
+      len(f35) == 2 and all(x.fixable for x in f35) and
+      all(len(x.payload["edges"]) >= 1 for x in f35))
+if len(f35) == 2:
+    cur35 = {1: g35_t, 2: g35_u}
+    for x35 in f35:
+        cur35.update(fixes35.insert_t_vertex(
+            cur35, x35.payload["pos"], x35.payload["edges"], 1e-6))
+    check("35 T: после вставок примыканий нет (повторная проверка)",
+          checks35.TJunctionCheck().run(
+              _ctx35(cur35[1], cur35[2])) == [])
+
+# GAP/OVERLAP/INVALID на стабе без GEOS: деградация без исключений
+check("35 GAP: на стабе без unaryUnion — пусто и без исключений",
+      checks35.GapCheck().run(_ctx35(g35_t, g35_u)) == [])
+check("35 OVERLAP: на стабе без intersection площадей — пусто",
+      checks35.OverlapCheck().run(_ctx35(g35_t, g35_u)) == [])
+check("35 INVALID: валидные стаб-геометрии не помечаются",
+      checks35.InvalidCheck().run(_ctx35(g35_t, g35_u)) == [])
+
+# Реестр и константы приёмки
+check("35 реестр: 8 проверок, безопасные коды и порядок исправлений",
+      len(checks35.CHECK_CLASSES) == 8 and
+      set(C35_SAFE) == {C35_DUP, C35_T, C35_NEAR, C35_GAP} and
+      checks35.FIX_ORDER == (C35_DUP, C35_NEAR, C35_T, C35_GAP))
+fnd35 = Finding35(C35_SPIKE, fid=7,
+                  point=pt(1, 2), area=3.0, message=u"m",
+                  fixable=True, payload={"a": 1}, layer_id="L35")
+check("35 Finding: ключ стабилен, поля на месте",
+      fnd35.key() == (C35_SPIKE, "L35", 7, "1.000000,2.000000") and
+      fnd35.layer_id == "L35")
+
+# run_checks: сортировка по (код, fid) и живучесть при сбое проверки
+ctx35 = _ctx35(g35_t, g35_u)
+ctx35["cancelled"] = lambda: False
+res35 = checks35.run_checks(ctx35)
+check("35 run_checks: находки отсортированы по (код, fid)",
+      res35 == sorted(res35, key=lambda f: (f.code, f.fid)))
+
+# ---------------------------------------------------------------------------
 print("")
 if FAILURES:
     print("ИТОГ: ПРОВАЛЕНО тестов: %d -> %s" % (len(FAILURES), FAILURES))
